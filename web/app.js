@@ -1433,13 +1433,46 @@ function paintThemeBtn() {
 
 // ============================================================ routing
 
+// ---------- view state in the URL
+//
+// A table's search, filters, sorts and hidden fields follow the path after a
+// "?", e.g. #/t/public/orders?q=acme&sort=["-total"], so a link opens the same
+// view in another browser. A query, when present, describes the whole view;
+// without one the view saved in this browser is used. Column widths, row
+// height and fit to screen stay per browser.
+
+function viewParams(v) {
+  const p = new URLSearchParams();
+  if (v.search) p.set("q", v.search);
+  if (v.filters.length) p.set("f", JSON.stringify(v.filters.map((f) => (f.op === "sql" ? { op: "sql", val: f.val ?? "" } : { col: f.col, op: f.op, val: f.val ?? "" }))));
+  if (v.sort.length) p.set("sort", JSON.stringify(v.sort.map((s) => (s.desc ? "-" : "+") + s.col)));
+  if (v.hidden.length) p.set("hide", JSON.stringify(v.hidden));
+  return p.toString();
+}
+
+function parseViewParams(qs) {
+  const p = new URLSearchParams(qs);
+  const list = (k) => { try { const a = JSON.parse(p.get(k) || "[]"); return Array.isArray(a) ? a : []; } catch { return []; } };
+  const str = (v) => (v == null ? "" : String(v));
+  return {
+    search: p.get("q") || "",
+    filters: list("f")
+      .filter((f) => f && typeof f === "object" && (f.op === "sql" || (Object.hasOwn(OP_LABEL, f.op) && typeof f.col === "string")))
+      .map((f) => (f.op === "sql" ? { op: "sql", val: str(f.val) } : { col: f.col, op: f.op, val: str(f.val) })),
+    sort: list("sort").filter((s) => typeof s === "string" && /^[+-]./s.test(s)).map((s) => ({ col: s.slice(1), desc: s[0] === "-" })),
+    hidden: list("hide").filter((h) => typeof h === "string"),
+  };
+}
+
 function route() {
   if (!S.meta || !$("[data-main]")) return;
+  const raw = location.hash.replace(/^#\/?/, "");
+  const qi = raw.indexOf("?"); // a "?" in a name is %-escaped, so the first one starts the query
   let parts;
-  try { parts = location.hash.replace(/^#\/?/, "").split("/").map(decodeURIComponent); } catch { parts = []; } // a malformed %-escape
+  try { parts = (qi < 0 ? raw : raw.slice(0, qi)).split("/").map(decodeURIComponent); } catch { parts = []; } // a malformed %-escape
   let next;
   if (parts[0] === "sql" && S.meta.sql !== false) next = { type: "sql" }; // -no-sql: falls through to a table
-  else if (parts[0] === "t" && parts[1] && parts[2]) next = { type: "table", schema: parts[1], name: parts[2], tab: parts[3] === "structure" ? "structure" : "grid" };
+  else if (parts[0] === "t" && parts[1] && parts[2]) next = { type: "table", schema: parts[1], name: parts[2], tab: parts[3] === "structure" ? "structure" : "grid", view: qi < 0 ? null : parseViewParams(raw.slice(qi + 1)) };
   else {
     const first = S.tables.find((t) => t.schema === "public") || S.tables[0];
     if (first) { location.replace(`#/t/${encodeURIComponent(first.schema)}/${encodeURIComponent(first.name)}`); return; }
@@ -1448,6 +1481,8 @@ function route() {
   const v = S.view;
   if (v && next.type === "table" && v instanceof TableView && v.ref.schema === next.schema && v.ref.name === next.name) {
     v.setTab(next.tab);
+    if (next.view) v.fromURL(next.view);
+    else v.syncURL();
     return;
   }
   if (v && v.destroy) v.destroy();
@@ -1634,6 +1669,7 @@ class TableView {
     this.lastMs = null;
     this.key = `aa.v:${S.meta.database}:${ref.schema}.${ref.name}`;
     this.settings = Object.assign({ hidden: [], widths: {}, sort: [], filters: [], rh: 0, search: "", fit: false }, store.get(this.key, {}));
+    this.urlView = ref.view || null; // adopted once the columns are known
     if (S.pendingFilter && S.pendingFilter.schema === ref.schema && S.pendingFilter.name === ref.name) {
       this.settings.filters = [S.pendingFilter.filter];
       this.settings.search = "";
@@ -1655,16 +1691,70 @@ class TableView {
     }
     if (this.dead) return;
     const m = this.meta;
-    const names = new Set(m.columns.map((c) => c.name));
-    this.settings.hidden = this.settings.hidden.filter((h) => names.has(h));
-    this.settings.sort = this.settings.sort.filter((s) => names.has(s.col));
-    this.settings.filters = this.settings.filters.filter((f) => f.op === "sql" ? S.meta.sql !== false : names.has(f.col));
+    if (this.urlView) {
+      const view = this.urlView;
+      this.urlView = null;
+      await this.adopt(view);
+      if (this.dead) return;
+    }
+    this.clean();
     this.editable = !!m.keyMode && !S.meta.readonly;
     this.offset = m.keyMode === "ctid" ? 1 : 0;
     this.renderFrame();
+    this.syncURL();
   }
 
-  save() { store.set(this.key, this.settings); }
+  // Drops settings that name fields the table no longer has.
+  clean() {
+    const cols = this.meta.columns;
+    const names = new Set(cols.map((c) => c.name));
+    this.settings.hidden = this.settings.hidden.filter((h) => names.has(h));
+    if (cols.length && this.settings.hidden.length >= cols.length) this.settings.hidden = this.settings.hidden.filter((h) => h !== cols[0].name);
+    this.settings.sort = this.settings.sort.filter((s) => names.has(s.col));
+    this.settings.filters = this.settings.filters.filter((f) => f.op === "sql" ? S.meta.sql !== false : names.has(f.col));
+  }
+
+  // Takes the search, filters, sorts and hidden fields from a link. A raw SQL
+  // filter runs with the viewer's privileges, so one the viewer does not
+  // already have is applied only after they confirm it.
+  async adopt(view) {
+    const own = new Set(this.settings.filters.filter((f) => f.op === "sql").map((f) => (f.val || "").trim()));
+    const sqls = view.filters.filter((f) => f.op === "sql" && f.val.trim() && !own.has(f.val.trim()));
+    let filters = view.filters;
+    if (sqls.length) {
+      const ok = S.meta.sql !== false && (await dialog({
+        title: "Apply SQL filter from link?",
+        body: `This link filters ${this.ref.name} with SQL that runs as you: ${sqls.map((f) => f.val.trim()).join(" AND ")}`,
+        ok: "Apply filter", cancel: "Skip it", danger: false,
+      }));
+      if (!ok) filters = filters.filter((f) => !sqls.includes(f));
+    }
+    Object.assign(this.settings, { search: view.search, filters, sort: view.sort, hidden: view.hidden });
+    this.save();
+  }
+
+  // A link to the table that is already open, e.g. Back, or a pasted URL.
+  async fromURL(view) {
+    if (!this.meta) { this.urlView = view; return; }
+    if (viewParams(view) === viewParams(this.settings)) return;
+    await this.adopt(view);
+    if (this.dead) return;
+    this.clean();
+    const search = $("[data-search]", this.main);
+    if (search) search.value = this.settings.search;
+    if (this.grid) this.grid.setCols(this.columns());
+    this.applyView();
+  }
+
+  // Writes the current view into the address bar, without a history entry.
+  syncURL() {
+    if (S.view !== this || this.dead || !this.meta) return;
+    const q = viewParams(this.settings);
+    const h = `#/t/${encodeURIComponent(this.ref.schema)}/${encodeURIComponent(this.ref.name)}${this.tab === "structure" ? "/structure" : ""}${q ? "?" + q : ""}`;
+    if (location.hash !== h) history.replaceState(history.state, "", h);
+  }
+
+  save() { store.set(this.key, this.settings); this.syncURL(); }
 
   renderFrame() {
     const m = this.meta;
@@ -2737,7 +2827,8 @@ function renderRecord() {
       if (!(await closeDrawer())) return;
       S.pendingFilter = { schema: x.schema, name: x.table, filter: { col: x.column, op: "eq", val: v } };
       const h = `#/t/${encodeURIComponent(x.schema)}/${encodeURIComponent(x.table)}`;
-      if (location.hash === h && S.view instanceof TableView) { S.view.settings.filters = [S.pendingFilter.filter]; S.pendingFilter = null; S.view.applyView(); }
+      // Compared by name: the hash of the open table may also carry a view query.
+      if (S.view instanceof TableView && S.view.ref.schema === x.schema && S.view.ref.name === x.table) { S.view.settings.filters = [S.pendingFilter.filter]; S.pendingFilter = null; S.view.applyView(); }
       else location.hash = h;
     }
   });

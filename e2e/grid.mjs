@@ -88,6 +88,54 @@ const tests = {
     `);
   },
 
+  async "a link opens the same view in a browser that has none saved"(sc) {
+    return run(`
+      await sql("CREATE TABLE ${sc}.items (id int PRIMARY KEY, v text, w text); INSERT INTO ${sc}.items SELECT g, 'v' || g, 'w' || g FROM generate_series(1, 30) g; CREATE TABLE ${sc}.other (id int PRIMARY KEY)");
+      await open_("${sc}", "items");
+      Object.assign(S.view.settings, { search: "v", filters: [{ col: "id", op: "lte", val: "10" }], sort: [{ col: "id", desc: true }], hidden: ["w"] });
+      S.view.applyView();
+      const link = location.hash;
+      if (!link.includes("?")) throw new Error("no view in the hash: " + link);
+      localStorage.removeItem(S.view.key);
+      await open_("${sc}", "other");
+      location.hash = link;
+      await until(() => S.view && S.view.meta && S.view.meta.name === "items" && S.view.rows.ready, "table from the link");
+      await until(() => S.view.rows.get(0), "first row");
+      const s = S.view.settings;
+      if (s.search !== "v" || s.filters.length !== 1 || s.filters[0].val !== "10" || !s.sort[0]?.desc || s.hidden.join() !== "w") throw new Error("settings: " + JSON.stringify(s));
+      if (S.view.rows.get(0)[0] !== "10") throw new Error("first row " + S.view.rows.get(0)[0]);
+      if (document.querySelector("[data-search]").value !== "v") throw new Error("search box not filled");
+      if (S.view.grid.cols.some((c) => c.name === "w")) throw new Error("hidden field shown");
+
+      // The same table, a new link: the view follows (Back, or a pasted URL).
+      location.hash = "#/t/${sc}/items?" + new URLSearchParams({ f: JSON.stringify([{ op: "sql", val: "id = 3" }]) });
+      await until(() => S.view.settings.filters[0]?.op === "sql" && S.view.rows.get(0)?.[0] === "3", "SQL filter from the link");
+      if (S.view.settings.search || S.view.settings.sort.length || S.view.settings.hidden.length) throw new Error("a link's query should describe the whole view");
+
+      // A plain link opens the view saved in this browser, and writes it back into the URL.
+      await open_("${sc}", "other");
+      location.hash = "#/t/${sc}/items";
+      await until(() => S.view.meta?.name === "items" && location.hash.includes("?f="), "saved view in the URL");
+    `);
+  },
+
+  async "a link's SQL filter is applied only after the viewer agrees"(sc) {
+    return run(`
+      await sql("CREATE TABLE ${sc}.items (id int PRIMARY KEY); INSERT INTO ${sc}.items SELECT generate_series(1, 5)");
+      __AA_E2E.confirm = false;
+      try {
+        location.hash = "#/t/${sc}/items?" + new URLSearchParams({ f: JSON.stringify([{ op: "sql", val: "id = 2" }, { col: "id", op: "gte", val: "2" }]) });
+        await until(() => document.querySelector(".dialog [data-no]"), "confirm dialog");
+        if (!document.querySelector(".dialog").textContent.includes("id = 2")) throw new Error("dialog does not show the SQL");
+        document.querySelector(".dialog [data-no]").click();
+        await until(() => S.view.meta?.name === "items" && S.view.rows.ready && S.view.rows.get(0), "rows");
+        const f = S.view.settings.filters;
+        if (f.length !== 1 || f[0].op !== "gte") throw new Error("filters: " + JSON.stringify(f));
+        if (S.view.rows.get(0)[0] !== "2") throw new Error("first row " + S.view.rows.get(0)[0]);
+      } finally { __AA_E2E.confirm = true; }
+    `);
+  },
+
   async "an edit lands on its record after the rows moved"(sc) {
     return run(`
       await sql("CREATE TABLE ${sc}.items (id int PRIMARY KEY, v text); INSERT INTO ${sc}.items SELECT g, 'orig' FROM generate_series(1, 50) g");
@@ -304,6 +352,9 @@ const tests = {
       window.fetch = (u, o) => { if (String(u).endsWith("api/rows")) bodies.push(JSON.parse(o.body)); return orig(u, o); };
       try {
         const g = S.view.grid, at = 15000;
+        // Until the exact count arrives the height follows the planner's estimate,
+        // which can be far too small for a fresh table, and the jump is clamped.
+        await until(() => S.view.rows.exact && S.view.rows.count() === 20000, "exact count");
         g.sc.scrollTop = at * g.rh; g.draw();
         await until(() => S.view.rows.get(at), "jump");
         for (let r = at; r < at + 2000; r += 200) { g.sc.scrollTop = r * g.rh; g.draw(); await until(() => S.view.rows.get(r + 199), "down " + r); }
@@ -451,6 +502,16 @@ const nosqlTests = {
       if (/SQL editor/.test(document.querySelector(".palette").textContent)) throw new Error("the palette offers the SQL editor");
       const status = await api("query", { sql: "SELECT 1" }).then(() => 200, (e) => e.status);
       if (status !== 403) throw new Error("the query endpoint answered " + status);
+    `);
+  },
+
+  async "with -no-sql a link's SQL filter is dropped"() {
+    return run(`
+      await until(() => S.view && S.view.meta && S.view.rows && S.view.rows.ready, "a table");
+      const { schema, name } = S.view.meta;
+      location.hash = "#/t/" + encodeURIComponent(schema) + "/" + encodeURIComponent(name) + "?" + new URLSearchParams({ f: JSON.stringify([{ op: "sql", val: "false" }]) });
+      await until(() => !location.hash.includes("?f="), "the SQL filter removed from the URL");
+      if (S.view.settings.filters.length) throw new Error("filters: " + JSON.stringify(S.view.settings.filters));
     `);
   },
 };

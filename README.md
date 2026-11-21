@@ -25,6 +25,7 @@ There is no runtime, no Node build, no config file, and no external assets. The 
 - The View menu also has a compact density (smaller rows, padding and type, for all tables) and "Fit columns to screen" (Ctrl/⌘+Shift+F), which scales the columns to the visible width without changing their saved widths. When even the narrowest columns cannot all fit, the grid scrolls sideways as usual.
 - Filters are built per type (is, contains, <, ≥, is empty, is checked …) and can include raw SQL conditions. Sorting can use several fields, and there is a search box that matches any field.
 - Hidden fields, column widths, sorts, filters, row height and fit to screen are remembered for each table in your browser.
+- The address bar carries the search, filters, sorts and hidden fields, so you can bookmark a view or send the link to someone. A link opens exactly that view; a link without one opens the view saved in that browser. Column widths, row height and fit to screen stay per browser. A raw SQL filter in a link runs only after the person opening it agrees, because it runs with their privileges. With `-no-sql` it is dropped.
 
 **Records**
 - The expanded record form has a type-aware editor for every field: a true/false/null toggle for booleans, tag pickers for enums, monospace editors for JSON, and an explicit "null" button. When you create a record, any field you leave untouched uses its column default.
