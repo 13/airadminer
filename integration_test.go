@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -76,10 +77,13 @@ func testDB(t *testing.T, setup string) string {
 }
 
 type client struct {
-	t   *testing.T
-	h   http.Handler
-	sid string
-	db  string // sent as X-Airadminer-Db when set
+	t    *testing.T
+	h    http.Handler
+	sid  string
+	db   string            // sent as X-Airadminer-Db when set
+	peer string            // RemoteAddr host (default 127.0.0.1)
+	hdr  map[string]string // extra request headers
+	last *httptest.ResponseRecorder
 }
 
 func (c *client) call(path string, body any) (int, map[string]any) {
@@ -87,6 +91,12 @@ func (c *client) call(path string, body any) (int, map[string]any) {
 	b, _ := json.Marshal(body)
 	req := httptest.NewRequest("POST", "http://127.0.0.1/api/"+path, bytes.NewReader(b))
 	req.RemoteAddr = "127.0.0.1:1234"
+	if c.peer != "" {
+		req.RemoteAddr = c.peer + ":1234"
+	}
+	for k, v := range c.hdr {
+		req.Header.Set(k, v)
+	}
 	req.Header.Set("X-Airadminer", "1")
 	if c.db != "" {
 		req.Header.Set(dbHeader, url.PathEscape(c.db))
@@ -94,10 +104,14 @@ func (c *client) call(path string, body any) (int, map[string]any) {
 	if c.sid != "" {
 		req.AddCookie(&http.Cookie{Name: cookieName, Value: c.sid})
 	}
+	if c.sid != "" {
+		req.AddCookie(&http.Cookie{Name: hostCookieName, Value: c.sid})
+	}
 	rec := httptest.NewRecorder()
 	c.h.ServeHTTP(rec, req)
+	c.last = rec
 	for _, ck := range rec.Result().Cookies() {
-		if ck.Name == cookieName {
+		if ck.Name == cookieName || ck.Name == hostCookieName {
 			c.sid = ck.Value
 		}
 	}
@@ -533,5 +547,284 @@ func TestIntegrationConcurrentLoad(t *testing.T) {
 	}
 	if n := runtime.NumGoroutine(); n > before+5 {
 		t.Fatalf("goroutines: %d before, %d after", before, n)
+	}
+}
+
+// auditTo sends the app's audit events to a buffer and returns a reader.
+func auditTo(a *App) func() []map[string]any {
+	var buf safeBuffer
+	a.auditLog = slog.New(slog.NewJSONHandler(&buf, nil))
+	return func() []map[string]any {
+		var out []map[string]any
+		for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+			var m map[string]any
+			if json.Unmarshal([]byte(line), &m) == nil {
+				out = append(out, m)
+			}
+		}
+		return out
+	}
+}
+
+type safeBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *safeBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *safeBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+func TestIntegrationAuditLog(t *testing.T) {
+	db := testDB(t, `CREATE TABLE t (id int PRIMARY KEY, secret text); INSERT INTO t VALUES (1, 'old');`)
+	a := newApp(config{addr: "127.0.0.1:0"})
+	defer a.closeAll()
+	events := auditTo(a)
+	u := testDSN(t)
+	bad := &client{t: t, h: a.routes()}
+	bad.call("login", loginBody(u, db, "wrong-password"))
+	c := signIn(t, a, db)
+	c.db = db
+	c.hdr = map[string]string{"X-Request-Id": "spoofed"} // not from a trusted proxy: ignored
+	c.call("update", map[string]any{"schema": "public", "name": "t", "key": map[string]any{"id": "1"}, "values": map[string]any{"secret": "s3cr3t-value"}})
+	c.call("update", map[string]any{"schema": "public", "name": "t", "key": map[string]any{"id": "9"}, "values": map[string]any{"secret": "x"}})
+	c.call("query", map[string]any{"sql": "SELECT 'hunter2' AS pw; SELECT nope"})
+	c.call("rows", map[string]any{"schema": "public", "name": "t"}) // reads are not audited
+
+	ev := events()
+	var got []string
+	for _, e := range ev {
+		got = append(got, fmt.Sprint(e["event"], ":", e["ok"]))
+	}
+	want := "login:false login:true update:true update:false sql:false"
+	if strings.Join(got, " ") != want {
+		t.Fatalf("events: %v, want %s", got, want)
+	}
+	upd := ev[2]
+	if upd["table"] != "public.t" || upd["database"] != db || upd["db_user"] != u.User.Username() || fmt.Sprint(upd["columns"]) != "[secret]" {
+		t.Fatalf("update event: %v", upd)
+	}
+	if upd["request_id"] == "spoofed" || upd["request_id"] == "" {
+		t.Fatalf("request id: %v", upd["request_id"])
+	}
+	all := fmt.Sprint(ev)
+	for _, leak := range []string{"s3cr3t-value", "hunter2", "wrong-password", `"keys"`} {
+		if strings.Contains(all, leak) {
+			t.Fatalf("audit log contains %q: %s", leak, all)
+		}
+	}
+	if ev[4]["sql_sha256"] == nil {
+		t.Fatalf("sql event: %v", ev[4])
+	}
+
+	// With -audit-detail, SQL text and keys are recorded (values still not).
+	a.cfg.auditDetail = true
+	c.call("query", map[string]any{"sql": "SELECT 1"})
+	c.call("delete", map[string]any{"schema": "public", "name": "t", "keys": []any{map[string]any{"id": "1"}}})
+	ev = events()
+	if ev[5]["sql"] != "SELECT 1" || fmt.Sprint(ev[6]["keys"]) != "[map[id:1]]" {
+		t.Fatalf("detail events: %v %v", ev[5], ev[6])
+	}
+}
+
+func TestIntegrationMetrics(t *testing.T) {
+	db := testDB(t, `CREATE TABLE t (id int PRIMARY KEY);`)
+	a := newApp(config{addr: "127.0.0.1:0"})
+	defer a.closeAll()
+	c := signIn(t, a, db)
+	c.db = db
+	c.call("rows", map[string]any{"schema": "public", "name": "t"})
+	rec := httptest.NewRecorder()
+	a.opsRoutes().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	body := rec.Body.String()
+	for _, want := range []string{
+		`airadminer_http_requests_total{route="POST /api/rows",code="200"} 1`,
+		`airadminer_http_request_duration_seconds_count{route="POST /api/rows"} 1`,
+		`airadminer_logins_total{result="ok"} 1`,
+		"airadminer_sessions 1",
+		`airadminer_db_connections{state="max"} 4`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics lack %q", want)
+		}
+	}
+	if t.Failed() {
+		t.Log(body)
+	}
+}
+
+func TestIntegrationSessionLifetime(t *testing.T) {
+	db := testDB(t, `CREATE TABLE t (id int PRIMARY KEY);`)
+	a := newApp(config{addr: "127.0.0.1:0", sessionLifetime: time.Hour})
+	defer a.closeAll()
+	c := signIn(t, a, db)
+	if code, _ := c.call("tables", nil); code != 200 {
+		t.Fatalf("fresh session: %d", code)
+	}
+	a.mu.Lock()
+	s := a.sessions[c.sid]
+	a.mu.Unlock()
+	s.mu.Lock()
+	s.created = time.Now().Add(-2 * time.Hour) // in use all along, but signed in too long ago
+	s.mu.Unlock()
+	if code, _ := c.call("tables", nil); code != http.StatusUnauthorized {
+		t.Fatalf("expired session: %d, want 401", code)
+	}
+	if a.sessionCount() != 0 {
+		t.Fatal("expired session not removed")
+	}
+}
+
+// Behind a trusted HTTPS proxy, the cookie is Secure with the __Host-
+// prefix, and sign-in attempts are limited per browser, not per proxy.
+func TestIntegrationBehindProxy(t *testing.T) {
+	db := testDB(t, "")
+	a := newApp(config{addr: "127.0.0.1:0", trustProxy: "10.9.9.9"})
+	defer a.closeAll()
+	u := testDSN(t)
+	pw, _ := u.User.Password()
+	c := &client{t: t, h: a.routes(), peer: "10.9.9.9", hdr: map[string]string{"X-Forwarded-Proto": "https", "X-Forwarded-For": "203.0.113.7"}}
+	if code, out := c.call("login", loginBody(u, db, pw)); code != 200 {
+		t.Fatalf("login: %v", out)
+	}
+	var ck *http.Cookie
+	for _, x := range c.last.Result().Cookies() {
+		if x.Name == hostCookieName {
+			ck = x
+		}
+	}
+	if ck == nil || !ck.Secure || ck.Path != "/" {
+		t.Fatalf("cookie: %+v", c.last.Result().Cookies())
+	}
+	if c.last.Header().Get("Strict-Transport-Security") == "" {
+		t.Fatal("no HSTS over HTTPS")
+	}
+	if code, _ := c.call("tables", nil); code != 200 {
+		t.Fatalf("session with __Host- cookie: %d", code)
+	}
+	attacker := &client{t: t, h: c.h, peer: "10.9.9.9", hdr: map[string]string{"X-Forwarded-For": "198.51.100.1"}}
+	limited := false
+	for i := 0; i < 15; i++ {
+		if code, _ := attacker.call("login", loginBody(u, db, "nope")); code == http.StatusTooManyRequests {
+			limited = true
+			break
+		}
+	}
+	if !limited {
+		t.Fatal("attacker was never rate-limited")
+	}
+	other := &client{t: t, h: c.h, peer: "10.9.9.9", hdr: map[string]string{"X-Forwarded-For": "203.0.113.8"}}
+	if code, _ := other.call("login", loginBody(u, db, pw)); code == http.StatusTooManyRequests {
+		t.Fatal("another browser behind the same proxy was rate-limited")
+	}
+}
+
+// With -dsn, one browser switching database does not move anyone else.
+func TestIntegrationDSNDatabaseSwitchIsPerBrowser(t *testing.T) {
+	dbA := testDB(t, `CREATE TABLE only_a (id int PRIMARY KEY);`)
+	dbB := testDB(t, `CREATE TABLE only_b (id int PRIMARY KEY);`)
+	u := testDSN(t)
+	du := *u
+	du.Path = "/" + dbA
+	a := newApp(config{addr: "127.0.0.1:0", dsn: du.String()})
+	if err := a.initFixed(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer a.closeAll()
+	h := a.routes()
+	one := &client{t: t, h: h, db: dbA}
+	two := &client{t: t, h: h, db: dbA}
+	if code, out := one.call("use", map[string]any{"database": dbB}); code != 200 {
+		t.Fatalf("use: %v", out)
+	}
+	one.db = dbB
+	if _, out := one.call("meta", nil); out["database"] != dbB {
+		t.Fatalf("switching browser is on %v", out["database"])
+	}
+	if _, out := two.call("meta", nil); out["database"] != dbA {
+		t.Fatalf("other browser moved to %v", out["database"])
+	}
+	if code, out := two.call("rows", map[string]any{"schema": "public", "name": "only_a"}); code != 200 {
+		t.Fatalf("other browser: %d %v", code, out)
+	}
+	if code, out := one.call("use", map[string]any{"database": dbA}); code != 200 {
+		t.Fatalf("switch back: %v", out)
+	}
+	if a.sessionCount() != 1 {
+		t.Fatalf("switching back made another session: %d", a.sessionCount())
+	}
+}
+
+func TestIntegrationNoSQL(t *testing.T) {
+	db := testDB(t, `CREATE TABLE t (id int PRIMARY KEY, v text); INSERT INTO t VALUES (1, 'a');`)
+	a := newApp(config{addr: "127.0.0.1:0", noSQL: true})
+	defer a.closeAll()
+	c := signIn(t, a, db)
+	c.db = db
+	if code, _ := c.call("query", map[string]any{"sql": "SELECT 1"}); code != http.StatusForbidden {
+		t.Fatalf("query: %d", code)
+	}
+	raw := map[string]any{"schema": "public", "name": "t", "filters": []any{map[string]any{"op": "sql", "val": "true"}}}
+	for _, path := range []string{"rows", "count", "export"} {
+		if code, _ := c.call(path, raw); code != http.StatusForbidden {
+			t.Errorf("%s with a SQL filter: %d", path, code)
+		}
+	}
+	if code, _ := c.call("rows", map[string]any{"schema": "public", "name": "t"}); code != 200 {
+		t.Fatalf("plain rows: %d", code)
+	}
+	if _, out := c.call("meta", nil); out["sql"] != false {
+		t.Fatalf("meta sql = %v", out["sql"])
+	}
+}
+
+// The escaping exporter writes what COPY writes, except for formulas.
+func TestIntegrationCSVEscaping(t *testing.T) {
+	db := testDB(t, `CREATE TABLE t (id int PRIMARY KEY, v text, n numeric, j jsonb);
+		INSERT INTO t VALUES (1, 'plain', 1.5, '{"a": [1, "x,y"]}'), (2, '', -3, NULL), (3, NULL, NULL, '"q\"uote"'),
+		  (4, E'multi\nline, "quoted"', 0, '[]'), (5, ' spaced ', 2e10, '{}');`)
+	export := func(escape bool, filter string) string {
+		a := newApp(config{addr: "127.0.0.1:0", csvEscape: escape})
+		defer a.closeAll()
+		c := signIn(t, a, db)
+		c.db = db
+		body := map[string]any{"schema": "public", "name": "t"}
+		if filter != "" {
+			body["filters"] = []any{map[string]any{"op": "sql", "val": filter}}
+		}
+		c.call("export", body)
+		if c.last.Code != 200 {
+			t.Fatalf("export: %d %s", c.last.Code, c.last.Body.String())
+		}
+		return c.last.Body.String()
+	}
+	if copyOut, escOut := export(false, ""), export(true, ""); copyOut != escOut {
+		t.Fatalf("outputs differ:\nCOPY:\n%s\nescaping:\n%s", copyOut, escOut)
+	}
+	other, _ := pgx.Connect(context.Background(), func() string { du := *testDSN(t); du.Path = "/" + db; return du.String() }())
+	defer other.Close(context.Background())
+	other.Exec(context.Background(), `INSERT INTO t VALUES (6, '=HYPERLINK("http://x")', -1, NULL), (7, '@SUM(1)', NULL, NULL), (8, '-x', NULL, NULL)`)
+	out := export(true, "id >= 6")
+	for _, want := range []string{`6,"'=HYPERLINK(""http://x"")",-1,`, "7,'@SUM(1),,", "8,'-x,,"} {
+		if !strings.Contains(out, want+"\n") {
+			t.Errorf("missing %q in\n%s", want, out)
+		}
+	}
+	// A failing query is still answered as a JSON error, not a broken file.
+	a := newApp(config{addr: "127.0.0.1:0", csvEscape: true})
+	defer a.closeAll()
+	c := signIn(t, a, db)
+	c.db = db
+	code, res := c.call("export", map[string]any{"schema": "public", "name": "t", "filters": []any{map[string]any{"op": "sql", "val": "nope"}}})
+	if code != http.StatusBadRequest || res["error"] == nil || c.last.Header().Get("Content-Disposition") != "" {
+		t.Fatalf("bad filter: %d %v", code, res)
 	}
 }

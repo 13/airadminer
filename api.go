@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -41,6 +41,16 @@ type apiErr struct {
 const dbHeader = "X-Airadminer-Db"
 
 type handler func(s *Session, db *DB, w http.ResponseWriter, r *http.Request) (any, error)
+
+// auditedRoutes: every request to these is written to the audit log,
+// whether it succeeds or not. Reads other than exports are not audited.
+var auditedRoutes = map[string]string{
+	"/api/update": "update", "/api/insert": "insert", "/api/delete": "delete",
+	"/api/duplicate": "duplicate", "/api/batch": "batch", "/api/query": "sql",
+	"/api/export": "export", "/api/use": "use_database", "/api/logout": "logout",
+}
+
+var errNoSQL = errors.New("SQL is turned off on this server (-no-sql)")
 
 func (a *App) registerAPI(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/login", a.guard(a.handleLogin))
@@ -96,7 +106,16 @@ func (a *App) authed(h handler) http.HandlerFunc {
 			}
 		}
 		out, err := h(s, db, w, r)
+		ri := infoOf(r)
+		if ev, ok := auditedRoutes[r.URL.Path]; ok {
+			aerr := err
+			if aerr == nil {
+				aerr = ri.auditErr
+			}
+			a.audit(r, ev, aerr, "database", db.name, "db_user", db.user)
+		}
 		if err != nil {
+			ri.err = err.Error()
 			writeErr(w, err)
 			return
 		}
@@ -110,7 +129,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(v); err != nil {
-		log.Printf("write response: %v", err)
+		slog.Warn("write response", "error", err)
 	}
 }
 
@@ -123,6 +142,10 @@ func writeErr(w http.ResponseWriter, err error) {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
 		writeJSON(w, http.StatusBadRequest, apiErr{Error: pgErr.Message, Detail: pgErr.Detail, Hint: pgErr.Hint, Code: pgErr.Code, Position: pgErr.Position, Index: index})
+		return
+	}
+	if errors.Is(err, errNoSQL) {
+		writeJSON(w, http.StatusForbidden, apiErr{Error: err.Error(), Code: "nosql"})
 		return
 	}
 	if errors.Is(err, context.Canceled) {
@@ -166,7 +189,8 @@ func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 		return
 	}
-	if !a.logins.allow(hostOnly(r.RemoteAddr), time.Now()) {
+	if !a.logins.allow(a.clientIP(r), time.Now()) {
+		a.metrics.count("logins", "limited")
 		w.Header().Set("Retry-After", "10")
 		writeJSON(w, http.StatusTooManyRequests, apiErr{Error: "too many sign-in attempts; wait a few seconds and try again"})
 		return
@@ -177,18 +201,24 @@ func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cfg, err := a.loginConfig(req)
-	if err != nil {
+	fail := func(err error) {
+		a.metrics.count("logins", "failed")
+		a.audit(r, "login", err, "host", req.Host, "port", req.Port, "db_user", req.User, "database", req.Database)
 		writeErr(w, err)
+	}
+	if err != nil {
+		fail(err)
 		return
 	}
 	old := a.sessionFor(r)
-	if (old == nil || old.fixed) && a.sessionCount() >= a.cfg.maxSessions {
+	if old == nil && a.sessionCount() >= a.cfg.maxSessions {
+		a.metrics.count("logins", "full")
 		writeJSON(w, http.StatusServiceUnavailable, apiErr{Error: errTooManySessions.Error()})
 		return
 	}
 	s, err := a.openSession(r.Context(), cfg)
 	if err != nil {
-		writeErr(w, err)
+		fail(err)
 		return
 	}
 	if old != nil && !old.fixed {
@@ -196,9 +226,12 @@ func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := a.addSession(w, r, s); err != nil {
 		go s.close()
+		a.metrics.count("logins", "full")
 		writeJSON(w, http.StatusServiceUnavailable, apiErr{Error: err.Error()})
 		return
 	}
+	a.metrics.count("logins", "ok")
+	a.audit(r, "login", nil, "host", cfg.ConnConfig.Host, "port", cfg.ConnConfig.Port, "db_user", cfg.ConnConfig.User, "database", s.db.name)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -213,7 +246,7 @@ func (a *App) handleLogout(s *Session, db *DB, w http.ResponseWriter, r *http.Re
 func (a *App) handleMeta(s *Session, db *DB, w http.ResponseWriter, r *http.Request) (any, error) {
 	ctx := r.Context()
 	pool := db.pool
-	out := map[string]any{"fixed": s.fixed, "readonly": a.cfg.readonly, "version": version}
+	out := map[string]any{"fixed": s.fixed, "readonly": a.cfg.readonly, "version": version, "sql": !a.cfg.noSQL, "csvEscape": a.cfg.csvEscape}
 	var user, dbName, server, host string
 	var ro string
 	err := pool.QueryRow(ctx, `SELECT current_user, current_database(), current_setting('server_version'),
@@ -248,6 +281,23 @@ func (a *App) handleUse(s *Session, db *DB, w http.ResponseWriter, r *http.Reque
 	}
 	if req.Database == "" {
 		return nil, errors.New("database is required")
+	}
+	note(r, "to", req.Database)
+	if s == a.fixed {
+		// With -dsn everyone shares one session. Switching database gives
+		// this browser a session of its own, so nobody else is moved.
+		if a.sessionCount() >= a.cfg.maxSessions {
+			return nil, errTooManySessions
+		}
+		own := &Session{baseCfg: s.baseCfg, fixed: true, created: time.Now(), lastUsed: time.Now()}
+		if err := own.connect(r.Context(), req.Database, a.cfg); err != nil {
+			return nil, err
+		}
+		if err := a.addSession(w, r, own); err != nil {
+			go own.close()
+			return nil, err
+		}
+		return map[string]any{"ok": true}, nil
 	}
 	if err := s.connect(r.Context(), req.Database, a.cfg); err != nil {
 		return nil, err
@@ -343,6 +393,14 @@ func strp(s string) *string { return &s }
 
 // hasRawSQL reports whether the view carries user-written SQL, which may
 // change session state (set_config, advisory locks) on its connection.
+// checkView refuses raw SQL filters when SQL is turned off.
+func (a *App) checkView(req *viewReq) error {
+	if a.cfg.noSQL && req.hasRawSQL() {
+		return errNoSQL
+	}
+	return nil
+}
+
 func (req *viewReq) hasRawSQL() bool {
 	for _, f := range req.Filters {
 		if f.Op == "sql" {
@@ -480,6 +538,9 @@ func (a *App) handleRows(s *Session, db *DB, w http.ResponseWriter, r *http.Requ
 	if err := decode(r, &req); err != nil {
 		return nil, err
 	}
+	if err := a.checkView(&req); err != nil {
+		return nil, err
+	}
 	ctx := r.Context()
 	m, err := db.tableMeta(ctx, req.Schema, req.Name, false)
 	if err != nil {
@@ -513,6 +574,9 @@ func (a *App) handleRows(s *Session, db *DB, w http.ResponseWriter, r *http.Requ
 func (a *App) handleCount(s *Session, db *DB, w http.ResponseWriter, r *http.Request) (any, error) {
 	var req viewReq
 	if err := decode(r, &req); err != nil {
+		return nil, err
+	}
+	if err := a.checkView(&req); err != nil {
 		return nil, err
 	}
 	m, err := db.tableMeta(r.Context(), req.Schema, req.Name, false)
@@ -576,6 +640,24 @@ type editReq struct {
 	Keys   []rowKey           `json:"keys"`
 	Values map[string]*string `json:"values"`
 	Expect map[string]*string `json:"expect"`
+}
+
+// noteWrite records what a write touches for the audit log: the table, the
+// columns and the number of records. Keys only with -audit-detail; values never.
+func (a *App) noteWrite(r *http.Request, m *TableMeta, values map[string]*string, keys []rowKey) {
+	cols := make([]string, 0, len(values))
+	for _, c := range m.Columns {
+		if _, ok := values[c.Name]; ok {
+			cols = append(cols, c.Name)
+		}
+	}
+	note(r, "table", m.Schema+"."+m.Name, "records", max(len(keys), 1))
+	if len(cols) > 0 {
+		note(r, "columns", cols)
+	}
+	if a.cfg.auditDetail && len(keys) > 0 {
+		note(r, "keys", keys)
+	}
 }
 
 func (a *App) editable(db *DB, ctx context.Context, ref tableRef) (*TableMeta, error) {
@@ -665,6 +747,7 @@ func (a *App) handleUpdate(s *Session, db *DB, w http.ResponseWriter, r *http.Re
 	if err != nil {
 		return nil, err
 	}
+	a.noteWrite(r, m, req.Values, []rowKey{req.Key})
 	st, err := updateSQL(m, req.Key, req.Values, req.Expect)
 	if err != nil {
 		return nil, err
@@ -682,6 +765,7 @@ func (a *App) handleInsert(s *Session, db *DB, w http.ResponseWriter, r *http.Re
 	if err != nil {
 		return nil, err
 	}
+	a.noteWrite(r, m, req.Values, nil)
 	st, err := insertSQL(m, req.Values)
 	if err != nil {
 		return nil, err
@@ -716,6 +800,14 @@ func (a *App) handleBatch(s *Session, db *DB, w http.ResponseWriter, r *http.Req
 		return nil, err
 	}
 	n := len(req.Updates) + len(req.Inserts) + len(req.Deletes)
+	note(r, "table", m.Schema+"."+m.Name, "updates", len(req.Updates), "inserts", len(req.Inserts), "deletes", len(req.Deletes))
+	if a.cfg.auditDetail {
+		keys := make([]rowKey, 0, len(req.Updates))
+		for _, u := range req.Updates {
+			keys = append(keys, u.Key)
+		}
+		note(r, "keys", keys, "deleted_keys", req.Deletes)
+	}
 	if n == 0 {
 		return nil, errors.New("nothing to change")
 	}
@@ -820,6 +912,7 @@ func (a *App) handleDelete(s *Session, db *DB, w http.ResponseWriter, r *http.Re
 	if err != nil {
 		return nil, err
 	}
+	a.noteWrite(r, m, nil, req.Keys)
 	if len(req.Keys) == 0 {
 		return nil, errors.New("no rows selected")
 	}
@@ -905,6 +998,7 @@ func (a *App) handleDuplicate(s *Session, db *DB, w http.ResponseWriter, r *http
 	if err != nil {
 		return nil, err
 	}
+	a.noteWrite(r, m, req.Values, req.Keys)
 	if len(req.Keys) == 0 {
 		return nil, errors.New("no rows selected")
 	}
@@ -957,9 +1051,13 @@ func (a *App) handleQuery(s *Session, db *DB, w http.ResponseWriter, r *http.Req
 	if err := decode(r, &req); err != nil {
 		return nil, err
 	}
+	if a.cfg.noSQL {
+		return nil, errNoSQL
+	}
 	if strings.TrimSpace(req.SQL) == "" {
 		return nil, errors.New("write a query first")
 	}
+	note(r, a.sqlNote(req.SQL)...)
 	ctx := r.Context()
 	done, err := db.startLong(ctx)
 	if err != nil {
@@ -1025,6 +1123,7 @@ func (a *App) handleQuery(s *Session, db *DB, w http.ResponseWriter, r *http.Req
 			e = apiErr{Error: pgErr.Message, Detail: pgErr.Detail, Hint: pgErr.Hint, Code: pgErr.Code, Position: pgErr.Position}
 		}
 		out["error"] = e
+		infoOf(r).auditErr = errors.New(e.Error)
 	}
 	if mayChangeSchema(req.SQL) {
 		db.forgetMeta()
@@ -1085,10 +1184,22 @@ func (a *App) handleExport(s *Session, db *DB, w http.ResponseWriter, r *http.Re
 	if err := decode(r, &req); err != nil {
 		return nil, err
 	}
+	if err := a.checkView(&req); err != nil {
+		return nil, err
+	}
 	ctx := r.Context()
 	m, err := db.tableMeta(ctx, req.Schema, req.Name, false)
 	if err != nil {
 		return nil, err
+	}
+	note(r, "table", m.Schema+"."+m.Name, "filters", len(req.Filters), "search", req.Search != "")
+	for _, f := range req.Filters {
+		if f.Op == "sql" && f.Val != nil {
+			note(r, a.sqlNote(*f.Val)...)
+		}
+	}
+	if a.cfg.csvEscape {
+		return a.exportEscaped(ctx, w, db, m, &req)
 	}
 	args := &sqlArgs{inline: true}
 	where, err := buildWhere(m, &req, args)
@@ -1118,7 +1229,7 @@ func (a *App) handleExport(s *Session, db *DB, w http.ResponseWriter, r *http.Re
 			w.Header().Del("Content-Disposition")
 			return nil, err
 		}
-		log.Printf("export %s.%s: %v", m.Schema, m.Name, err)
+		a.log.Warn("export failed after it started", "table", m.Schema+"."+m.Name, "error", err)
 	}
 	if !bw.started {
 		w.WriteHeader(http.StatusOK)

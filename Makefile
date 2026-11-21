@@ -2,7 +2,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 PLATFORMS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64
 
-.PHONY: build run test test-integration e2e lint dist clean demo
+.PHONY: build run test test-integration e2e fuzz lint dist clean demo
 
 build:
 	CGO_ENABLED=0 go build -trimpath -ldflags '$(LDFLAGS)' -o airadminer .
@@ -22,6 +22,12 @@ test-integration:
 # Browser tests of the grid in headless Chrome (needs `make demo` and google-chrome)
 e2e: build
 	./e2e/run.sh
+
+FUZZTIME ?= 30s
+fuzz:
+	@for f in $$(grep -ho '^func Fuzz[A-Za-z]*' *_test.go | cut -c6-); do \
+		echo "  $$f"; go test -run '^$$' -fuzz "^$$f$$" -fuzztime $(FUZZTIME) . || exit 1; \
+	done
 
 lint:
 	test -z "$$(gofmt -l .)"

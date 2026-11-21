@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"sync"
@@ -14,8 +15,10 @@ import (
 )
 
 const (
-	cookieName  = "airadminer_sid"
-	idleTimeout = 12 * time.Hour
+	cookieName = "airadminer_sid"
+	// Over HTTPS the cookie gets the __Host- prefix: browsers then insist on
+	// Secure, Path=/ and no Domain, so no subdomain can set or shadow it.
+	hostCookieName = "__Host-airadminer_sid"
 )
 
 // DB is one connection pool pointed at one database, together with the
@@ -24,6 +27,7 @@ const (
 // of one database can never be cached under another.
 type DB struct {
 	name string
+	user string // PostgreSQL role, for the audit log
 	pool *pgxpool.Pool
 
 	metaMu    sync.Mutex
@@ -42,14 +46,19 @@ type Session struct {
 	id       string
 	baseCfg  *pgxpool.Config // as given at login; database may be swapped
 	db       *DB
+	created  time.Time
 	lastUsed time.Time
-	fixed    bool
+	fixed    bool // connects with -dsn: no sign-in or sign-out
 }
 
 type App struct {
 	cfg      config
 	policy   *hostPolicy
 	logins   *loginLimiter
+	trust    *trustList
+	log      *slog.Logger
+	auditLog *slog.Logger
+	metrics  *metrics
 	mu       sync.Mutex
 	sessions map[string]*Session
 	fixed    *Session
@@ -63,7 +72,15 @@ func newApp(cfg config) *App {
 	if cfg.poolSize <= 0 {
 		cfg.poolSize = 4
 	}
-	a := &App{cfg: cfg, policy: policy, logins: newLoginLimiter(10, 6*time.Second), sessions: map[string]*Session{}}
+	if cfg.sessionIdle <= 0 {
+		cfg.sessionIdle = 12 * time.Hour
+	}
+	if cfg.sessionLifetime <= 0 {
+		cfg.sessionLifetime = 24 * time.Hour
+	}
+	trust, _ := parseTrust(cfg.trustProxy)
+	a := &App{cfg: cfg, policy: policy, logins: newLoginLimiter(10, 6*time.Second), trust: trust,
+		log: slog.Default(), auditLog: slog.Default(), metrics: newMetrics(), sessions: map[string]*Session{}}
 	go a.reaper()
 	return a
 }
@@ -73,10 +90,7 @@ func (a *App) reaper() {
 		var idle []*Session
 		a.mu.Lock()
 		for id, s := range a.sessions {
-			s.mu.Lock()
-			old := time.Since(s.lastUsed) > idleTimeout
-			s.mu.Unlock()
-			if old {
+			if !a.alive(s) {
 				idle = append(idle, s)
 				delete(a.sessions, id)
 			}
@@ -118,8 +132,22 @@ func (a *App) initFixed(ctx context.Context) error {
 	return nil
 }
 
+// alive reports whether a session may still be used: not idle for longer
+// than -session-idle, nor older than -session-lifetime. The shared -dsn
+// session never expires.
+func (a *App) alive(s *Session) bool {
+	if s == a.fixed {
+		return true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	return now.Sub(s.lastUsed) < a.cfg.sessionIdle && now.Sub(s.created) < a.cfg.sessionLifetime
+}
+
 func (a *App) openSession(ctx context.Context, cfg *pgxpool.Config) (*Session, error) {
-	s := &Session{baseCfg: cfg, lastUsed: time.Now()}
+	now := time.Now()
+	s := &Session{baseCfg: cfg, created: now, lastUsed: now}
 	if err := s.connect(ctx, cfg.ConnConfig.Database, a.cfg); err != nil {
 		return nil, err
 	}
@@ -163,7 +191,7 @@ func (s *Session) connect(ctx context.Context, db string, ac config) error {
 		pool.Close()
 		return err
 	}
-	next := &DB{name: db, pool: pool, metaCache: map[string]*TableMeta{}, typeNames: map[uint32]string{}, long: make(chan struct{}, max(1, cfg.MaxConns-1))}
+	next := &DB{name: db, user: cfg.ConnConfig.User, pool: pool, metaCache: map[string]*TableMeta{}, typeNames: map[uint32]string{}, long: make(chan struct{}, max(1, cfg.MaxConns-1))}
 	if next.name == "" {
 		next.name = cfg.ConnConfig.Database
 	}
@@ -212,17 +240,33 @@ func newID() string {
 	return hex.EncodeToString(b)
 }
 
+func sessionID(r *http.Request) string {
+	for _, name := range []string{hostCookieName, cookieName} {
+		if c, err := r.Cookie(name); err == nil && c.Value != "" {
+			return c.Value
+		}
+	}
+	return ""
+}
+
+// sessionFor returns the browser's session. With -dsn every browser shares
+// one session until it switches database, which gives it its own.
 func (a *App) sessionFor(r *http.Request) *Session {
-	if a.fixed != nil {
-		return a.fixed
+	if id := sessionID(r); id != "" {
+		a.mu.Lock()
+		s := a.sessions[id]
+		a.mu.Unlock()
+		if s != nil && a.alive(s) {
+			return s
+		}
+		if s != nil {
+			a.mu.Lock()
+			delete(a.sessions, id)
+			a.mu.Unlock()
+			go s.close()
+		}
 	}
-	c, err := r.Cookie(cookieName)
-	if err != nil {
-		return nil
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.sessions[c.Value]
+	return a.fixed
 }
 
 var errTooManySessions = errors.New("too many people are signed in to this server; try again later")
@@ -242,12 +286,16 @@ func (a *App) addSession(w http.ResponseWriter, r *http.Request, s *Session) err
 	}
 	a.sessions[s.id] = s
 	a.mu.Unlock()
+	name, secure := cookieName, a.isSecure(r)
+	if secure {
+		name = hostCookieName
+	}
 	http.SetCookie(w, &http.Cookie{
-		Name:     cookieName,
+		Name:     name,
 		Value:    s.id,
 		Path:     "/",
 		HttpOnly: true,
-		Secure:   r.TLS != nil,
+		Secure:   secure,
 		SameSite: http.SameSiteStrictMode,
 	})
 	return nil
@@ -259,4 +307,5 @@ func (a *App) dropSession(w http.ResponseWriter, s *Session) {
 	a.mu.Unlock()
 	go s.close()
 	http.SetCookie(w, &http.Cookie{Name: cookieName, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteStrictMode})
+	http.SetCookie(w, &http.Cookie{Name: hostCookieName, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode})
 }

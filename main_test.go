@@ -389,3 +389,68 @@ func TestCutRows(t *testing.T) {
 		t.Fatal("a relation without a key must not be cut")
 	}
 }
+
+func TestClientIPAndSecure(t *testing.T) {
+	a := newApp(config{addr: "127.0.0.1:0", trustProxy: "10.0.0.1, 192.168.0.0/16"})
+	req := func(peer, xff, proto string) *http.Request {
+		r := httptest.NewRequest("GET", "/", nil)
+		r.RemoteAddr = peer + ":5555"
+		if xff != "" {
+			r.Header.Set("X-Forwarded-For", xff)
+		}
+		if proto != "" {
+			r.Header.Set("X-Forwarded-Proto", proto)
+		}
+		return r
+	}
+	cases := []struct{ peer, xff, want string }{
+		{"8.8.8.8", "1.1.1.1", "8.8.8.8"},                        // not a proxy: header ignored
+		{"10.0.0.1", "1.1.1.1", "1.1.1.1"},                       // proxy
+		{"10.0.0.1", "6.6.6.6, 1.1.1.1, 192.168.1.5", "1.1.1.1"}, // spoofed first entry skipped
+		{"10.0.0.1", "", "10.0.0.1"},
+		{"10.0.0.1", "junk, 192.168.1.5", "10.0.0.1"},
+	}
+	for _, c := range cases {
+		if got := a.clientIP(req(c.peer, c.xff, "")); got != c.want {
+			t.Errorf("peer %s XFF %q: got %s, want %s", c.peer, c.xff, got, c.want)
+		}
+	}
+	if !a.isSecure(req("10.0.0.1", "", "https")) || a.isSecure(req("8.8.8.8", "", "https")) || a.isSecure(req("10.0.0.1", "", "http")) {
+		t.Fatal("X-Forwarded-Proto must count only from a trusted proxy")
+	}
+}
+
+func TestAuthHeaderNeedsTrustedProxy(t *testing.T) {
+	a := newApp(config{addr: "0.0.0.0:0", trustProxy: "10.0.0.1", authHeader: "X-Forwarded-User"})
+	h := a.routes()
+	get := func(peer, user string) int {
+		r := httptest.NewRequest("GET", "/", nil)
+		r.RemoteAddr = peer + ":1"
+		if user != "" {
+			r.Header.Set("X-Forwarded-User", user)
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w.Code
+	}
+	if c := get("10.0.0.2", "mallory"); c != http.StatusForbidden {
+		t.Fatalf("forged header from a non-proxy: %d", c)
+	}
+	if c := get("10.0.0.1", ""); c != http.StatusUnauthorized {
+		t.Fatalf("proxy without user: %d", c)
+	}
+	if c := get("10.0.0.1", "alice"); c != http.StatusOK {
+		t.Fatalf("proxy with user: %d", c)
+	}
+	if err := (config{maxSessions: 1, poolSize: 1, sessionIdle: 1, sessionLifetime: 1, authHeader: "X-U"}).check(); err == nil {
+		t.Fatal("-auth-header without -trust-proxy must be refused")
+	}
+}
+
+func TestEscapeFormula(t *testing.T) {
+	for in, want := range map[string]string{"=1+1": "'=1+1", "+x": "'+x", "-5": "-5", "-1.5e3": "-1.5e3", "-x": "'-x", "@SUM(A1)": "'@SUM(A1)", "\tx": "'\tx", "ok": "ok", "": ""} {
+		if got := escapeFormula(in); got != want {
+			t.Errorf("%q: got %q, want %q", in, got, want)
+		}
+	}
+}

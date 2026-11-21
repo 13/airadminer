@@ -71,13 +71,24 @@ DATABASE_URL=postgres://app@db/app ./airadminer -readonly
 | `-allow-socket` | `AIRADMINER_ALLOW_SOCKET` | off | Login screen: allow unix-socket hosts |
 | `-require-tls` | `AIRADMINER_REQUIRE_TLS` | off | Login screen: upgrade `sslmode` `disable`/`allow`/`prefer` to `require` |
 | `-max-sessions` | `AIRADMINER_MAX_SESSIONS` | `64` | Most signed-in browser sessions at once |
-| `-pool-size` | `AIRADMINER_POOL_SIZE` | `4` | Database connections per session (with `-dsn`, shared by everyone) |
+| `-pool-size` | `AIRADMINER_POOL_SIZE` | `4` | Database connections per session (with `-dsn`, the shared session and each browser that switched database) |
 | `-statement-timeout` | `AIRADMINER_STATEMENT_TIMEOUT` | server default | Default `statement_timeout` for every connection, e.g. `5m` |
 | `-lock-timeout` | `AIRADMINER_LOCK_TIMEOUT` | `30s` | Default `lock_timeout` for every connection |
+| `-session-idle` | `AIRADMINER_SESSION_IDLE` | `12h` | Sign a browser out after this long without a request |
+| `-session-lifetime` | `AIRADMINER_SESSION_LIFETIME` | `24h` | Sign a browser out this long after it signed in, even while in use |
+| `-tls-cert`, `-tls-key` | `AIRADMINER_TLS_CERT`, `AIRADMINER_TLS_KEY` | – | Serve HTTPS (TLS 1.2+) with these PEM files |
+| `-trust-proxy` | `AIRADMINER_TRUST_PROXY` | – | IPs or CIDRs of reverse proxies whose `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Request-Id` and `-auth-header` are believed |
+| `-auth-header` | `AIRADMINER_AUTH_HEADER` | – | Sign-in through an authenticating proxy: require this header (e.g. `X-Forwarded-User`) from a `-trust-proxy` address |
+| `-no-sql` | `AIRADMINER_NO_SQL` | off | Turn off the SQL editor and raw SQL filters |
+| `-csv-escape-formulas` | `AIRADMINER_CSV_ESCAPE_FORMULAS` | off | Prefix CSV cells a spreadsheet would run as formulas with `'` |
+| `-log-format` | `AIRADMINER_LOG_FORMAT` | `text` | `text` or `json` |
+| `-audit-log` | `AIRADMINER_AUDIT_LOG` | main log | Write audit events as JSON lines to this file (mode 0600) |
+| `-audit-detail` | `AIRADMINER_AUDIT_DETAIL` | off | Include SQL text and record keys in audit events |
+| `-metrics-addr` | `AIRADMINER_METRICS_ADDR` | – | Serve Prometheus `/metrics` and `/healthz` on this address |
 
 `GET /healthz` answers `ok` without authentication, for liveness probes.
 
-Without `-dsn`, you see a login screen like Adminer's. Credentials are held in the server's memory for the session, which expires after 12 hours idle, and are never written to disk. Each browser session gets its own small connection pool.
+Without `-dsn`, you see a login screen like Adminer's. Credentials are held in the server's memory for the session, which ends after `-session-idle` without use or `-session-lifetime` after sign-in, and are never written to disk. Each browser session gets its own small connection pool.
 
 ## Security notes
 
@@ -92,7 +103,29 @@ Without `-dsn`, you see a login screen like Adminer's. Credentials are held in t
 - After every SQL editor run, and every grid query with a raw SQL filter, the connection is reset with `DISCARD ALL`. A `SET ROLE`, `SET session_replication_role`, temp table or advisory lock therefore never carries over to later edits. If the reset fails, the connection is closed.
 - Each session has `-pool-size` connections. SQL editor queries and CSV exports may use all but one of them, so browsing and saving keep working while long queries run. A request that finds no free connection for 20 seconds fails with HTTP 503 instead of queueing forever.
 - Every request names the database its page was built for. If another tab switched the session to a different database, edits are refused (HTTP 409) and the page reloads.
-- For TLS, put the server behind a reverse proxy such as Caddy or nginx. The UI uses relative URLs, so it also works under a sub-path.
+- For TLS, use `-tls-cert`/`-tls-key`, or a reverse proxy listed in `-trust-proxy` (see Operations). The UI uses relative URLs, so it also works under a sub-path.
+
+## Operations
+
+**Logs.** One line per API request: method, path, status, duration, bytes, client IP, request ID and, when known, the signed-in person. Use `-log-format json` for log shippers. Every response carries an `X-Request-Id` header. A trusted proxy can supply its own request ID.
+
+**Audit log.** Writes are recorded whether they succeed or fail: update, insert, delete, duplicate, batch (paste, clear, undo). So are SQL editor runs, CSV exports, sign-ins (failed ones too), sign-outs and database switches. Each event names the person, client IP, request ID, database, PostgreSQL role, table, columns and number of records. Cell values are never recorded. SQL text and record keys can hold personal data, so by default a run is recorded only by its size and a SHA-256 fingerprint; `-audit-detail` records the text and keys. `-audit-log FILE` keeps audit events apart from the main log.
+
+**Metrics.** `-metrics-addr 127.0.0.1:9090` serves Prometheus metrics on a separate listener without authentication. Keep that address internal. The metrics are:
+- requests and duration histograms per route and status
+- sign-in attempts by result
+- audited actions
+- open sessions
+- database connections (acquired, idle, max)
+- goroutines, heap size and the build version
+
+**HTTPS.** Either serve it directly with `-tls-cert`/`-tls-key`, or put a reverse proxy in front and list it in `-trust-proxy`. Behind a trusted proxy, the client address comes from `X-Forwarded-For` (used for rate limits and logs), and `X-Forwarded-Proto: https` counts as HTTPS. Over HTTPS the session cookie is `Secure` with the `__Host-` prefix, and responses carry `Strict-Transport-Security`.
+
+**Single sign-on.** Run an authenticating proxy such as oauth2-proxy (OIDC, SAML through your IdP) in front, list it in `-trust-proxy`, and set `-auth-header X-Forwarded-User`, or whichever header your proxy sets. Requests that do not come from the proxy are refused (403), so the header cannot be forged by reaching the port directly. The header's value appears in logs and audit events. With the login screen, people still sign in to PostgreSQL with their own credentials. With `-dsn`, the proxy is the only gate.
+
+**Locking down.** `-no-sql` removes the SQL editor and raw SQL filters on the server and hides them in the UI, leaving only the grid's own parameterised queries. Combine it with `-readonly` and a PostgreSQL role with limited grants for view-only access. `-csv-escape-formulas` protects people who open exports in Excel or Sheets from formula injection. Numbers such as `-5` are left as they are.
+
+**With `-dsn`,** all browsers share one session until one of them switches database. That browser then gets a session and pool of its own, counted against `-max-sessions`, so nobody else is moved.
 
 ## How editing works
 
@@ -115,6 +148,7 @@ make test       # go vet, go test -race, JS syntax check
 make lint       # gofmt, vet, staticcheck, govulncheck
 make test-integration  # tests against PostgreSQL (needs `make demo` running)
 make e2e        # browser tests of the grid in headless Chrome (needs `make demo`)
+make fuzz       # run every fuzz test for FUZZTIME (default 30s) each
 make demo       # throwaway Postgres on :55432 with sample data (password: secret)
 ```
 
@@ -127,5 +161,7 @@ login.go     login screen: connection settings, host policy, rate limit
 meta.go      catalog queries: tables, columns, keys, indexes, constraints
 api.go       JSON API: rows, count, update/insert/delete, SQL, CSV export
 cells.go     cutting long values, loading full values, connection limits
+ops.go       logs, request ids, audit events, metrics, trusted proxies
+export.go    CSV export with formula escaping
 web/         the entire UI: index.html, app.css, app.js (no build step)
 ```

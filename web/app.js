@@ -369,8 +369,12 @@ function parseTSV(text) {
   row.push(cur); rows.push(row);
   return rows;
 }
+// With -csv-escape-formulas, a cell a spreadsheet would run as a formula
+// gets a leading apostrophe, as server exports do.
+const escapeFormula = (v) => v && /^[=+\-@\t\r]/.test(v) && !/^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$/.test(v) ? "'" + v : v;
 function toCSV(header, rows) {
-  const q = (v) => v == null ? "" : /[",\n\r]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v;
+  const esc1 = (v) => S.meta && S.meta.csvEscape ? escapeFormula(v) : v;
+  const q = (v) => { if (v == null) return ""; v = esc1(v); return v === "" || /[",\n\r]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; };
   return [header.map(q).join(","), ...rows.map((r) => r.map(q).join(","))].join("\n") + "\n";
 }
 function download(name, blob) {
@@ -1093,7 +1097,7 @@ async function renderShell() {
       </div>
       <nav class="side-list" data-list></nav>
       <div class="side-foot">
-        <a class="tbl" href="#/sql" data-sqllink>${icon("i-terminal")}<span class="nm">SQL editor</span></a>
+        ${S.meta.sql !== false ? `<a class="tbl" href="#/sql" data-sqllink>${icon("i-terminal")}<span class="nm">SQL editor</span></a>` : ""}
         <div class="who" data-who></div>
         <div class="row">
           <button class="btn" data-themebtn></button>
@@ -1223,7 +1227,7 @@ function route() {
   let parts;
   try { parts = location.hash.replace(/^#\/?/, "").split("/").map(decodeURIComponent); } catch { parts = []; } // a malformed %-escape
   let next;
-  if (parts[0] === "sql") next = { type: "sql" };
+  if (parts[0] === "sql" && S.meta.sql !== false) next = { type: "sql" }; // -no-sql: falls through to a table
   else if (parts[0] === "t" && parts[1] && parts[2]) next = { type: "table", schema: parts[1], name: parts[2], tab: parts[3] === "structure" ? "structure" : "grid" };
   else {
     const first = S.tables.find((t) => t.schema === "public") || S.tables[0];
@@ -1257,7 +1261,7 @@ function bindTopbar(root) {
 function renderEmpty(main) {
   document.title = `${S.meta.database} · airadminer`;
   main.innerHTML = topbar(`<div class="crumb"><h2>${esc(S.meta.database)}</h2></div>`) + `
-    <div class="empty">${icon("k-r")}<h3>This database has no tables yet</h3><p>Create one with SQL, then it will show up in the sidebar.</p><a class="btn primary" href="#/sql">${icon("i-terminal")}Open SQL editor</a></div>`;
+    <div class="empty">${icon("k-r")}<h3>This database has no tables yet</h3><p>Tables you create show up in the sidebar.</p>${S.meta.sql !== false ? `<a class="btn primary" href="#/sql">${icon("i-terminal")}Open SQL editor</a>` : ""}</div>`;
   bindTopbar(main);
 }
 
@@ -1430,7 +1434,7 @@ class TableView {
     const names = new Set(m.columns.map((c) => c.name));
     this.settings.hidden = this.settings.hidden.filter((h) => names.has(h));
     this.settings.sort = this.settings.sort.filter((s) => names.has(s.col));
-    this.settings.filters = this.settings.filters.filter((f) => f.op === "sql" || names.has(f.col));
+    this.settings.filters = this.settings.filters.filter((f) => f.op === "sql" ? S.meta.sql !== false : names.has(f.col));
     this.editable = !!m.keyMode && !S.meta.readonly;
     this.offset = m.keyMode === "ctid" ? 1 : 0;
     this.renderFrame();
@@ -1681,7 +1685,7 @@ class TableView {
           <select class="select" data-i="${i}" data-k="op">${ops.map((o) => `<option value="${o}" ${o === f.op ? "selected" : ""}>${OP_LABEL[o]}</option>`).join("")}</select>
           ${val || "<span></span>"}${rm}</div>`;
       }).join("") : `<div class="none">No filters yet. Add a condition to narrow the rows.</div>`) +
-      `<div class="foot"><span><button class="btn" data-add>${icon("i-plus", "sm")}Add condition</button><button class="btn" data-addsql>${icon("i-terminal", "sm")}Add SQL condition</button></span>${fs.length ? `<button class="btn" data-clearall>Clear all</button>` : ""}</div>`;
+      `<div class="foot"><span><button class="btn" data-add>${icon("i-plus", "sm")}Add condition</button>${S.meta.sql !== false ? `<button class="btn" data-addsql>${icon("i-terminal", "sm")}Add SQL condition</button>` : ""}</span>${fs.length ? `<button class="btn" data-clearall>Clear all</button>` : ""}</div>`;
       curPop && curPop.place();
     };
     paint();
@@ -2884,7 +2888,7 @@ function palette() {
   document.body.append(scrim, el);
   const input = $("input", el), list = $(".scroll", el);
   const actions = [
-    { label: "Open SQL editor", icon: "i-terminal", run: () => (location.hash = "#/sql") },
+    ...(S.meta.sql !== false ? [{ label: "Open SQL editor", icon: "i-terminal", run: () => (location.hash = "#/sql") }] : []),
     ...THEME_ORDER.filter((t) => t !== themePref()).map((t) => ({ label: t === "system" ? "Theme: follow the system" : `Theme: ${t}`, icon: THEMES[t].icon, run: () => setTheme(t) })),
     { label: "Reload table list", icon: "i-refresh", run: async () => { await loadTables(); paintTables(); toast("Table list reloaded"); } },
     ...S.meta.databases.filter((d) => d !== S.meta.database).map((d) => ({ label: `Switch to database ${d}`, icon: "i-db", run: () => switchDB(d) })),

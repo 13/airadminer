@@ -39,6 +39,8 @@ jobs:
         run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
       - name: test (race, with PostgreSQL)
         run: go test -race -count=1 ./...
+      - name: fuzz (10s each)
+        run: make fuzz FUZZTIME=10s
       - name: js syntax
         run: node --check web/app.js && node --check web/theme.js
       - name: browser tests (headless Chrome)
