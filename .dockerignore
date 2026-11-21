@@ -1,0 +1,12 @@
+# Keep the build context to what `go build` needs: faster builds, and local
+# binaries, logs or git history never invalidate the layer cache.
+.git
+.github
+dist
+airadminer
+e2e
+testdata
+*.log
+*.md
+Dockerfile
+.dockerignore

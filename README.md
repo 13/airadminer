@@ -48,10 +48,12 @@ Build once with Go 1.25 or newer, then copy the binary anywhere. It has no depen
 make build          # or: make dist, for a linux/amd64 release binary
 ```
 
-Docker (about 16 MB, built `FROM scratch`):
+Docker (about 16 MB, built `FROM scratch`, linux/amd64). CI publishes images to the GitHub Container Registry: `latest` and `1.2.3` / `1.2` for release tags, `edge` for the main branch.
 
 ```sh
-docker build -t airadminer .
+docker run --rm -p 8080:8080 ghcr.io/<owner>/airadminer:latest
+# or build it yourself
+make docker            # tags airadminer:<version> and airadminer:latest
 docker run --rm -p 8080:8080 airadminer
 ```
 

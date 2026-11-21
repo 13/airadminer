@@ -2,7 +2,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 PLATFORMS ?= linux/amd64
 
-.PHONY: build run test test-integration e2e fuzz soak lint dist clean demo
+.PHONY: build run test test-integration e2e fuzz soak lint dist docker clean demo
 
 build:
 	CGO_ENABLED=0 go build -trimpath -ldflags '$(LDFLAGS)' -o airadminer .
@@ -54,6 +54,11 @@ demo:
 	docker run -d --name airadminer-pg -e POSTGRES_PASSWORD=secret -p 55432:5432 postgres:17-alpine
 	@until docker exec airadminer-pg pg_isready -U postgres >/dev/null 2>&1; do sleep 1; done
 	docker exec -i airadminer-pg psql -q -U postgres < testdata/seed.sql
+
+# Container image as CI builds it (linux/amd64, FROM scratch)
+IMAGE ?= airadminer
+docker:
+	docker build --platform linux/amd64 --build-arg VERSION=$(VERSION) -t $(IMAGE):$(VERSION) -t $(IMAGE):latest .
 
 clean:
 	rm -rf airadminer dist
