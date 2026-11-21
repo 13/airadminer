@@ -29,6 +29,11 @@ type DB struct {
 	metaMu    sync.Mutex
 	metaCache map[string]*TableMeta // schema + "\x00" + name -> meta
 	typeNames map[uint32]string
+
+	// long holds one token per running SQL-editor query or CSV export. It
+	// has one slot fewer than the pool, so browsing and saving always find
+	// a connection even while long queries run.
+	long chan struct{}
 }
 
 // Session holds one signed-in connection target. Credentials live only in memory.
@@ -158,7 +163,7 @@ func (s *Session) connect(ctx context.Context, db string, ac config) error {
 		pool.Close()
 		return err
 	}
-	next := &DB{name: db, pool: pool, metaCache: map[string]*TableMeta{}, typeNames: map[uint32]string{}}
+	next := &DB{name: db, pool: pool, metaCache: map[string]*TableMeta{}, typeNames: map[uint32]string{}, long: make(chan struct{}, max(1, cfg.MaxConns-1))}
 	if next.name == "" {
 		next.name = cfg.ConnConfig.Database
 	}

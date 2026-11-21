@@ -23,6 +23,7 @@ const (
 	maxBody       = 16 << 20
 	maxPageRows   = 1000
 	maxQueryRows  = 10000
+	maxQueryBytes = 32 << 20 // SQL editor result kept per request
 	countTimeout  = 3 * time.Second
 	exactCountMax = 2_000_000 // above this estimate, unfiltered counts use the planner estimate
 )
@@ -50,6 +51,7 @@ func (a *App) registerAPI(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/table", a.guard(a.authed(a.handleTable)))
 	mux.HandleFunc("POST /api/rows", a.guard(a.authed(a.handleRows)))
 	mux.HandleFunc("POST /api/count", a.guard(a.authed(a.handleCount)))
+	mux.HandleFunc("POST /api/cells", a.guard(a.authed(a.handleCells)))
 	mux.HandleFunc("POST /api/update", a.guard(a.authed(a.handleUpdate)))
 	mux.HandleFunc("POST /api/insert", a.guard(a.authed(a.handleInsert)))
 	mux.HandleFunc("POST /api/delete", a.guard(a.authed(a.handleDelete)))
@@ -142,7 +144,7 @@ func writeErr(w http.ResponseWriter, err error) {
 // reached or the connection broke, as opposed to a rejected statement.
 func isUnavailable(err error) bool {
 	var ce *pgconn.ConnectError
-	if errors.As(err, &ce) || pgconn.SafeToRetry(err) {
+	if errors.As(err, &ce) || pgconn.SafeToRetry(err) || errors.Is(err, errBusy) || errors.Is(err, errLongBusy) {
 		return true
 	}
 	var ne net.Error
@@ -436,22 +438,37 @@ func buildOrder(m *TableMeta, req *viewReq) (string, error) {
 }
 
 // selectList returns the grid's column expressions. Binary columns are
-// summarised by their size instead of shipping the bytes to the browser.
+// summarised by their size instead of shipping the bytes to the browser,
+// and long values are cut (see cells.go): the md5 of each cut column's
+// full text follows the visible columns, for finishRow to fold in.
 func selectList(m *TableMeta, forExport bool) string {
-	var parts []string
+	var parts, hashes []string
 	if m.KeyMode == "ctid" && !forExport {
 		// ctid alone is a slot that VACUUM can hand to another row; with
 		// xmin the key names exactly this version of this row.
 		parts = append(parts, `ctid::text || ':' || xmin::text AS "__ctid"`)
 	}
-	for _, c := range m.Columns {
+	cut := 0
+	if !forExport {
+		cut = cutLen(m)
+	}
+	for i := range m.Columns {
+		c := &m.Columns[i]
 		col := ident(c.Name)
-		if c.Udt == "bytea" && !forExport {
+		switch {
+		case forExport:
+			parts = append(parts, col)
+		case c.Udt == "bytea":
 			parts = append(parts, "octet_length("+col+")::text AS "+col)
-		} else {
+		case cut > 0 && cuttable(c):
+			n := strconv.Itoa(cut)
+			parts = append(parts, "left("+textOf(col)+", "+n+") AS "+col)
+			hashes = append(hashes, "CASE WHEN char_length("+textOf(col)+") > "+n+" THEN md5(format('%s', "+col+")) END")
+		default:
 			parts = append(parts, col)
 		}
 	}
+	parts = append(parts, hashes...)
 	if len(parts) == 0 {
 		return "NULL"
 	}
@@ -490,7 +507,7 @@ func (a *App) handleRows(s *Session, db *DB, w http.ResponseWriter, r *http.Requ
 	if err != nil {
 		return nil, err
 	}
-	return map[string]any{"rows": res.rows, "ms": time.Since(start).Milliseconds()}, nil
+	return map[string]any{"rows": finishRows(m, res.rows), "ms": time.Since(start).Milliseconds()}, nil
 }
 
 func (a *App) handleCount(s *Session, db *DB, w http.ResponseWriter, r *http.Request) (any, error) {
@@ -652,7 +669,7 @@ func (a *App) handleUpdate(s *Session, db *DB, w http.ResponseWriter, r *http.Re
 	if err != nil {
 		return nil, err
 	}
-	return db.writeOne(ctx, st.sql, st.args)
+	return db.writeOne(ctx, m, st)
 }
 
 func (a *App) handleInsert(s *Session, db *DB, w http.ResponseWriter, r *http.Request) (any, error) {
@@ -669,7 +686,7 @@ func (a *App) handleInsert(s *Session, db *DB, w http.ResponseWriter, r *http.Re
 	if err != nil {
 		return nil, err
 	}
-	return db.writeOne(ctx, st.sql, st.args)
+	return db.writeOne(ctx, m, st)
 }
 
 type batchReq struct {
@@ -733,13 +750,13 @@ func (a *App) handleBatch(s *Session, db *DB, w http.ResponseWriter, r *http.Req
 		return nil, err
 	}
 	u, i := len(req.Updates), len(req.Updates)+len(req.Inserts)
-	return map[string]any{"updated": rows[:u], "inserted": rows[u:i], "deleted": len(rows) - i}, nil
+	return map[string]any{"updated": finishRows(m, rows[:u]), "inserted": finishRows(m, rows[u:i]), "deleted": len(rows) - i}, nil
 }
 
 // writeMany runs each statement in one transaction. Each must touch exactly
 // one row; otherwise everything is rolled back.
 func (db *DB) writeMany(ctx context.Context, stmts []stmt) ([][]any, error) {
-	conn, err := db.pool.Acquire(ctx)
+	conn, err := db.acquire(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -785,12 +802,12 @@ type batchErr struct {
 func (e *batchErr) Error() string { return e.err.Error() }
 func (e *batchErr) Unwrap() error { return e.err }
 
-func (db *DB) writeOne(ctx context.Context, sql string, params [][]byte) (any, error) {
-	rows, err := db.writeMany(ctx, []stmt{{sql, params}})
+func (db *DB) writeOne(ctx context.Context, m *TableMeta, st stmt) (any, error) {
+	rows, err := db.writeMany(ctx, []stmt{st})
 	if err != nil {
 		return nil, err
 	}
-	return map[string]any{"row": rows[0]}, nil
+	return map[string]any{"row": finishRow(m, rows[0])}, nil
 }
 
 func (a *App) handleDelete(s *Session, db *DB, w http.ResponseWriter, r *http.Request) (any, error) {
@@ -809,7 +826,7 @@ func (a *App) handleDelete(s *Session, db *DB, w http.ResponseWriter, r *http.Re
 	if len(req.Keys) > maxBatch {
 		return nil, fmt.Errorf("delete up to %d records at a time", maxBatch)
 	}
-	conn, err := db.pool.Acquire(ctx)
+	conn, err := db.acquire(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -914,7 +931,7 @@ func (a *App) handleDuplicate(s *Session, db *DB, w http.ResponseWriter, r *http
 	if err != nil {
 		return nil, err
 	}
-	return map[string]any{"rows": rows}, nil
+	return map[string]any{"rows": finishRows(m, rows)}, nil
 }
 
 // ---------- SQL editor ----------
@@ -930,6 +947,7 @@ type queryResult struct {
 	Rows      [][]any    `json:"rows"`
 	Tag       string     `json:"tag"`
 	Truncated bool       `json:"truncated"`
+	Total     int64      `json:"total"` // rows the statement returned, kept or not
 }
 
 func (a *App) handleQuery(s *Session, db *DB, w http.ResponseWriter, r *http.Request) (any, error) {
@@ -943,7 +961,12 @@ func (a *App) handleQuery(s *Session, db *DB, w http.ResponseWriter, r *http.Req
 		return nil, errors.New("write a query first")
 	}
 	ctx := r.Context()
-	conn, err := db.pool.Acquire(ctx)
+	done, err := db.startLong(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+	conn, err := db.acquire(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -951,6 +974,7 @@ func (a *App) handleQuery(s *Session, db *DB, w http.ResponseWriter, r *http.Req
 	pc := conn.Conn().PgConn()
 	start := time.Now()
 	results := []queryResult{}
+	kept := 0 // bytes of every result so far
 	mrr := pc.Exec(ctx, req.SQL)
 	for mrr.NextResult() {
 		rr := mrr.ResultReader()
@@ -958,12 +982,25 @@ func (a *App) handleQuery(s *Session, db *DB, w http.ResponseWriter, r *http.Req
 		for _, f := range rr.FieldDescriptions() {
 			qr.Columns = append(qr.Columns, queryCol{Name: f.Name, OID: f.DataTypeOID})
 		}
+		// Rows past the caps are read and dropped rather than canceling the
+		// statement: canceling would roll back earlier statements of the
+		// same script, which run in one implicit transaction.
 		for rr.NextRow() {
-			if len(qr.Rows) >= maxQueryRows {
+			qr.Total++
+			if qr.Truncated {
+				continue
+			}
+			vals := rr.Values()
+			n := 16
+			for _, v := range vals {
+				n += len(v) + 8
+			}
+			if len(qr.Rows) >= maxQueryRows || kept+n > maxQueryBytes {
 				qr.Truncated = true
 				continue
 			}
-			qr.Rows = append(qr.Rows, textRow(rr.Values()))
+			kept += n
+			qr.Rows = append(qr.Rows, textRow(vals))
 		}
 		tag, err := rr.Close()
 		qr.Tag = tag.String()
@@ -1063,7 +1100,12 @@ func (a *App) handleExport(s *Session, db *DB, w http.ResponseWriter, r *http.Re
 		return nil, err
 	}
 	sql := "COPY (SELECT " + selectList(m, true) + " FROM " + ident(m.Schema, m.Name) + " AS " + rowAlias + where + order + ") TO STDOUT WITH (FORMAT csv, HEADER)"
-	conn, err := db.pool.Acquire(ctx)
+	done, err := db.startLong(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+	conn, err := db.acquire(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1166,7 +1208,7 @@ func textRow(vals [][]byte) []any {
 // execText runs one parameterised statement and returns every value in
 // PostgreSQL's own text format, so the browser sees exactly what psql would.
 func (db *DB) execText(ctx context.Context, sql string, params [][]byte, userSQL bool) (*textResult, error) {
-	conn, err := db.pool.Acquire(ctx)
+	conn, err := db.acquire(ctx)
 	if err != nil {
 		return nil, err
 	}

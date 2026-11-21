@@ -16,7 +16,10 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -339,5 +342,196 @@ func TestIntegrationExpectRoundTripsAndDetectsConflicts(t *testing.T) {
 	other.Exec(context.Background(), "UPDATE t SET x = NULL")
 	if code, res = c.call("update", map[string]any{"schema": "public", "name": "t", "key": map[string]any{"id": "1"}, "values": map[string]any{"x": "set"}, "expect": map[string]any{"x": nil}}); code != 200 {
 		t.Fatalf("expect null: %v", res)
+	}
+}
+
+// Long values reach the grid cut, with the md5 of the full text; /api/cells
+// returns the full values, and writes return cut rows the same way.
+func TestIntegrationLongValuesAreCut(t *testing.T) {
+	db := testDB(t, `CREATE TABLE t (id int PRIMARY KEY, doc text, j jsonb, arr int[], short text, pad char(5), nothing text);
+		INSERT INTO t VALUES (1, repeat('ab', 50000), (SELECT jsonb_agg(g) FROM generate_series(1, 20000) g),
+		  (SELECT array_agg(g) FROM generate_series(1, 20000) g), 'hi', 'x', NULL);`)
+	a := newApp(config{addr: "127.0.0.1:0"})
+	defer a.closeAll()
+	c := signIn(t, a, db)
+	c.db = db
+	ref := map[string]any{"schema": "public", "name": "t"}
+	_, out := c.call("rows", ref)
+	row := out["rows"].([]any)[0].([]any)
+	if len(row) != 8 {
+		t.Fatalf("want 7 values and a cut marker, got %d: %.200v", len(row), row)
+	}
+	cut, _ := row[7].(map[string]any)["cut"].(map[string]any)
+	if len(cut) != 3 || cut["1"] == nil || cut["2"] == nil || cut["3"] == nil {
+		t.Fatalf("cut marker: %v", row[7])
+	}
+	for i := 1; i <= 3; i++ {
+		if n := len([]rune(row[i].(string))); n > maxCut {
+			t.Errorf("column %d: %d characters reached the grid", i, n)
+		}
+	}
+	if row[4] != "hi" || row[5] != "x    " || row[6] != nil {
+		t.Fatalf("short values changed: %q %q %v", row[4], row[5], row[6])
+	}
+
+	u := testDSN(t)
+	du := *u
+	du.Path = "/" + db
+	other, err := pgx.Connect(context.Background(), du.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close(context.Background())
+	var doc, j, arr, hDoc string
+	other.QueryRow(context.Background(), "SELECT doc, j::text, arr::text, md5(doc) FROM t").Scan(&doc, &j, &arr, &hDoc)
+	if cut["1"] != hDoc {
+		t.Fatalf("hash %v, want md5 of the full text %v", cut["1"], hDoc)
+	}
+
+	_, out = c.call("cells", map[string]any{"schema": "public", "name": "t", "keys": []any{map[string]any{"id": "1"}, map[string]any{"id": "2"}}, "cols": []string{"doc", "j", "arr", "nothing"}})
+	rows := out["rows"].([]any)
+	if rows[1] != nil {
+		t.Fatalf("missing record: %v", rows[1])
+	}
+	full := rows[0].(map[string]any)
+	vals, hashes := full["values"].([]any), full["hashes"].([]any)
+	if vals[0] != doc || vals[1] != j || vals[2] != arr || vals[3] != nil {
+		t.Fatalf("full values differ")
+	}
+	if hashes[0] != hDoc || hashes[1] != cut["2"] || hashes[3] != nil {
+		t.Fatalf("hashes: %v", hashes)
+	}
+
+	// The full value round-trips as an expected value, and the row a write
+	// returns is cut too.
+	code, res := c.call("update", map[string]any{"schema": "public", "name": "t", "key": map[string]any{"id": "1"}, "values": map[string]any{"short": "yo"}, "expect": map[string]any{"doc": doc, "j": j}})
+	if code != 200 {
+		t.Fatalf("update with full expect: %v", res)
+	}
+	if r := res["row"].([]any); len(r) != 8 || r[4] != "yo" {
+		t.Fatalf("returned row: %.200v", r)
+	}
+	if code, out := c.call("cells", map[string]any{"schema": "public", "name": "t", "keys": []any{map[string]any{"id": "1"}}, "cols": []string{"nope"}}); code == 200 {
+		t.Fatalf("unknown column accepted: %v", out)
+	}
+}
+
+// The SQL editor keeps a bounded result, and dropping rows past the cap
+// does not roll back earlier statements of the same script.
+func TestIntegrationQueryResultIsCapped(t *testing.T) {
+	db := testDB(t, `CREATE TABLE t (n int); INSERT INTO t VALUES (0);`)
+	a := newApp(config{addr: "127.0.0.1:0"})
+	defer a.closeAll()
+	c := signIn(t, a, db)
+	c.db = db
+	code, out := c.call("query", map[string]any{"sql": "UPDATE t SET n = 1; SELECT repeat('x', 1000000) FROM generate_series(1, 100)"})
+	if code != 200 || out["error"] != nil {
+		t.Fatalf("query: %d %v", code, out)
+	}
+	res := out["results"].([]any)
+	last := res[len(res)-1].(map[string]any)
+	if last["truncated"] != true || last["total"] != float64(100) {
+		t.Fatalf("truncated=%v total=%v", last["truncated"], last["total"])
+	}
+	if n := len(last["rows"].([]any)); n == 0 || n*1000000 > maxQueryBytes {
+		t.Fatalf("kept %d rows of 1 MB", n)
+	}
+	_, out = c.call("query", map[string]any{"sql": "SELECT n FROM t"})
+	if v := out["results"].([]any)[0].(map[string]any)["rows"].([]any)[0].([]any)[0]; v != "1" {
+		t.Fatalf("earlier statement rolled back: n = %v", v)
+	}
+}
+
+// Long queries cannot take every connection: browsing still works, and a
+// query that finds no free slot fails fast with 503 instead of queueing.
+func TestIntegrationLongQueriesLeaveRoomForBrowsing(t *testing.T) {
+	db := testDB(t, `CREATE TABLE t (id int PRIMARY KEY); INSERT INTO t VALUES (1);`)
+	old := acquireWait
+	acquireWait = 300 * time.Millisecond
+	defer func() { acquireWait = old }()
+	a := newApp(config{addr: "127.0.0.1:0", poolSize: 2})
+	defer a.closeAll()
+	c := signIn(t, a, db)
+	c.db = db
+	started := make(chan struct{})
+	done := make(chan int)
+	go func() {
+		close(started)
+		code, _ := (&client{t: t, h: c.h, sid: c.sid, db: db}).call("query", map[string]any{"sql": "SELECT pg_sleep(1.5)"})
+		done <- code
+	}()
+	<-started
+	time.Sleep(200 * time.Millisecond)
+	if code, out := c.call("query", map[string]any{"sql": "SELECT 1"}); code != http.StatusServiceUnavailable {
+		t.Fatalf("second query while one runs: %d %v, want 503", code, out)
+	}
+	if code, out := c.call("rows", map[string]any{"schema": "public", "name": "t"}); code != 200 {
+		t.Fatalf("browsing while a query runs: %d %v", code, out)
+	}
+	if code := <-done; code != 200 {
+		t.Fatalf("long query: %d", code)
+	}
+}
+
+// Many concurrent requests on one session: every one succeeds and no
+// connection or goroutine is left behind.
+func TestIntegrationConcurrentLoad(t *testing.T) {
+	db := testDB(t, `CREATE TABLE t (id int PRIMARY KEY, v text, doc text);
+		INSERT INTO t SELECT g, 'v' || g, repeat('d', 20000) FROM generate_series(1, 500) g;`)
+	a := newApp(config{addr: "127.0.0.1:0", poolSize: 3})
+	defer a.closeAll()
+	c := signIn(t, a, db)
+	c.db = db
+	before := runtime.NumGoroutine()
+	const workers, each = 32, 15
+	errs := make(chan string, workers*each)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			cl := &client{t: t, h: c.h, sid: c.sid, db: db}
+			id := strconv.Itoa(w + 1)
+			for i := 0; i < each; i++ {
+				var code int
+				var out map[string]any
+				switch i % 5 {
+				case 0:
+					code, out = cl.call("rows", map[string]any{"schema": "public", "name": "t", "offset": w * 10, "limit": 200})
+				case 1:
+					code, out = cl.call("count", map[string]any{"schema": "public", "name": "t", "search": "v1"})
+				case 2:
+					code, out = cl.call("update", map[string]any{"schema": "public", "name": "t", "key": map[string]any{"id": id}, "values": map[string]any{"v": fmt.Sprint("w", i)}})
+				case 3:
+					code, out = cl.call("cells", map[string]any{"schema": "public", "name": "t", "keys": []any{map[string]any{"id": id}}, "cols": []string{"doc"}})
+				case 4:
+					code, out = cl.call("query", map[string]any{"sql": "SELECT pg_sleep(0.005), count(*) FROM t"})
+				}
+				if code != 200 {
+					errs <- fmt.Sprintf("worker %d step %d: %d %v", w, i, code, out)
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	close(errs)
+	for e := range errs {
+		t.Error(e)
+	}
+	s := a.sessionFor(func() *http.Request {
+		r := httptest.NewRequest("GET", "/", nil)
+		r.AddCookie(&http.Cookie{Name: cookieName, Value: c.sid})
+		return r
+	}())
+	st := s.current().pool.Stat()
+	if st.AcquiredConns() != 0 || st.TotalConns() > 3 {
+		t.Fatalf("pool after load: acquired %d, total %d", st.AcquiredConns(), st.TotalConns())
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for runtime.NumGoroutine() > before+5 && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if n := runtime.NumGoroutine(); n > before+5 {
+		t.Fatalf("goroutines: %d before, %d after", before, n)
 	}
 }

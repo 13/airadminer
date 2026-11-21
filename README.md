@@ -13,13 +13,14 @@ There is no runtime, no Node build, no config file, and no external assets. The 
 ## Features
 
 **Grid**
-- Virtual scrolling. Rows load in pages as you scroll, so a 50-million-row table opens as fast as a 50-row one.
+- Virtual scrolling. Rows load in pages as you scroll, so a 50-million-row table opens as fast as a 50-row one. Only the rows and columns on screen are drawn, and pages far from view are dropped, so memory stays flat however far you scroll. Changing a filter or sort cancels the requests of the old one.
+- Long values (text, JSON, arrays, XML …) reach the grid cut to a few thousand characters and marked with "…", so a page of rows stays small. Opening a cell, the record form, copying or overwriting loads the full value first. A long value is never saved shortened.
 - Each cell renders according to its data type. Numbers are right-aligned and tabular. Booleans show as checkboxes you can click. Enums get stable colored tags. Arrays become chips. JSON is syntax-tinted. Timestamps are split into date and time. Foreign keys show as link pills, and clicking one opens the referenced record.
 - Spreadsheet keyboard model: arrow keys, Tab, Enter, F2, Home and End, PageUp and PageDown, and Shift to extend a selection. Start typing to replace a cell's value. Delete sets a cell to null, Space expands the row, Ctrl/⌘+Shift+D duplicates the selected rows, and Ctrl/⌘+Z undoes the last change.
 - Undo covers cell edits, pastes, clears, duplicates and records added from the form. A paste or clear undoes in one step, and records it added are removed again. Deletes cannot be undone.
 - Right-click a cell or row number for a menu: expand, copy, clear, duplicate, delete.
 - Copy and paste use the TSV format that Sheets, Excel and Airtable use. Paste a block to fill a range, or paste one value to fill the whole selection. A block that runs past the last row adds new records; empty cells there get the column default. Each paste or clear is saved in one transaction, so it lands completely or not at all.
-- Selecting several cells shows Sum, Average, Min and Max for numeric columns in the footer.
+- Selecting several cells shows Sum, Average, Min and Max for numeric columns in the footer. Whole numbers add up exactly, beyond 2^53 too.
 - The first column and the row numbers stay frozen. You can resize columns, double-click a column edge to fit its content, and pick a short, medium or tall row height.
 - Filters are built per type (is, contains, <, ≥, is empty, is checked …) and can include raw SQL conditions. Sorting can use several fields, and there is a search box that matches any field.
 - Hidden fields, column widths, sorts, filters and row height are remembered for each table in your browser.
@@ -32,7 +33,7 @@ There is no runtime, no Node build, no config file, and no external assets. The 
 
 **Everything else**
 - The Structure tab lists fields, types, defaults, indexes with their sizes, constraints, references, and view definitions.
-- The SQL editor has syntax highlighting, multi-statement scripts, running only the selected text, query cancellation, per-database history, results shown in the same grid, and errors marked at the exact line and column.
+- The SQL editor keeps up to 10,000 rows or 32 MB of a result and reports how many rows the statement returned in total. Rows past the limit are read and dropped, not canceled, so earlier statements of the same script are not rolled back. It has syntax highlighting, multi-statement scripts, running only the selected text, query cancellation, per-database history, results shown in the same grid, and errors marked at the exact line and column.
 - Export the filtered view of any table to CSV. The export is streamed from `COPY`, so it doesn't hit the page size limit. Query results can be exported to CSV as well.
 - Ctrl/⌘+K opens a command palette that jumps to any table, switches database, or changes the theme.
 - Light and dark themes. The theme button cycles between following the system setting (the default), light and dark. The layout also works on phones.
@@ -89,6 +90,7 @@ Without `-dsn`, you see a login screen like Adminer's. Credentials are held in t
 - The login screen can reach any database host the server can reach. On a shared server, limit it with `-allow-hosts`. The check runs on every resolved address at connect time. Link-local addresses, where cloud metadata services live, are refused unless listed.
 - Sign-in attempts are rate-limited per client address (a burst of 10, then one every 6 seconds), and `-max-sessions` caps open sessions and their connection pools.
 - After every SQL editor run, and every grid query with a raw SQL filter, the connection is reset with `DISCARD ALL`. A `SET ROLE`, `SET session_replication_role`, temp table or advisory lock therefore never carries over to later edits. If the reset fails, the connection is closed.
+- Each session has `-pool-size` connections. SQL editor queries and CSV exports may use all but one of them, so browsing and saving keep working while long queries run. A request that finds no free connection for 20 seconds fails with HTTP 503 instead of queueing forever.
 - Every request names the database its page was built for. If another tab switched the session to a different database, edits are refused (HTTP 409) and the page reloads.
 - For TLS, put the server behind a reverse proxy such as Caddy or nginx. The UI uses relative URLs, so it also works under a sub-path.
 
@@ -97,6 +99,8 @@ Without `-dsn`, you see a login screen like Adminer's. Credentials are held in t
 Rows are identified by their primary key. Tables without one fall back to `ctid` together with `xmin`. That pair names one version of one row, so if the row changed, or was deleted and its slot reused by `VACUUM`, the edit is refused instead of landing on another row. Reload the rows and try again. Views without a primary key are read-only.
 
 Values travel as PostgreSQL's own text format in both directions, the same text `psql` shows. Each edit is one `UPDATE … WHERE <key> RETURNING …`. A paste, clear or undo sends all its changes in one transaction. It is rejected if the row no longer matches exactly one record.
+
+A cell cut in the grid comes with the md5 of its full value. Before such a cell is overwritten by a paste, a clear or an undo, the browser loads the full value and checks the hash, so the conflict check below and undo always work on the whole value.
 
 Edits never silently overwrite someone else's work. Each edit also sends the values you saw in the cells you changed. If someone else has changed one of those cells since, the edit is refused and you are asked to refresh. Undo works the same way: it reverts a cell only if the cell still holds what your change wrote.
 
@@ -122,5 +126,6 @@ session.go   login sessions and connection pools
 login.go     login screen: connection settings, host policy, rate limit
 meta.go      catalog queries: tables, columns, keys, indexes, constraints
 api.go       JSON API: rows, count, update/insert/delete, SQL, CSV export
+cells.go     cutting long values, loading full values, connection limits
 web/         the entire UI: index.html, app.css, app.js (no build step)
 ```

@@ -352,3 +352,40 @@ func TestUpdateAndInsertSQL(t *testing.T) {
 		t.Fatalf("insert = %s", st.sql)
 	}
 }
+
+func TestCutRows(t *testing.T) {
+	m := &TableMeta{Schema: "public", Name: "t", KeyMode: "pk", PK: []string{"id"}, Columns: []Column{
+		{Name: "id", Udt: "int4", Cat: "N", PK: true},
+		{Name: "doc", Udt: "text", Cat: "S"},
+		{Name: "n", Udt: "int4", Cat: "N"},
+		{Name: "j", Udt: "jsonb", Cat: "U"},
+		{Name: "bin", Udt: "bytea", Cat: "U"},
+	}}
+	if got := cutLen(m); got != maxCut {
+		t.Fatalf("cutLen = %d", got)
+	}
+	sel := selectList(m, false)
+	if !strings.Contains(sel, `left(CASE WHEN "doc" IS NULL`) || !strings.HasSuffix(sel, `md5(format('%s', "j")) END`) {
+		t.Fatalf("select list: %s", sel)
+	}
+	if strings.Contains(selectList(m, true), "left(") {
+		t.Fatal("export must not cut values")
+	}
+	h := "abc"
+	v := "x"
+	row := finishRow(m, []any{&v, &v, &v, &v, &v, &h, nil})
+	if len(row) != 6 {
+		t.Fatalf("row: %v", row)
+	}
+	cut := row[5].(map[string]any)["cut"].(map[string]string)
+	if len(cut) != 1 || cut["1"] != "abc" {
+		t.Fatalf("cut: %v", cut)
+	}
+	if row := finishRow(m, []any{&v, &v, &v, &v, &v, nil, nil}); len(row) != 5 {
+		t.Fatalf("uncut row: %v", row)
+	}
+	m.KeyMode = ""
+	if cutLen(m) != 0 || strings.Contains(selectList(m, false), "left(") {
+		t.Fatal("a relation without a key must not be cut")
+	}
+}

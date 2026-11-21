@@ -72,6 +72,16 @@ async function dbChanged() {
   } catch (e) { toastErr(e); } finally { reloadingDB = false; }
 }
 
+// A row whose long values the server cut ends with {cut: {index: md5}}.
+// It becomes row.cut, so every index of the row still names a column.
+function unpackRow(r) {
+  if (!Array.isArray(r) || !r.length) return;
+  const l = r[r.length - 1];
+  if (l && typeof l === "object" && !Array.isArray(l)) { r.pop(); r.cut = l.cut; }
+}
+const unpackRows = (rows) => { if (Array.isArray(rows)) rows.forEach(unpackRow); };
+const isCut = (row, i) => !!(row && row.cut && row.cut[i] != null);
+
 async function api(path, body, { signal, raw } = {}) {
   let r;
   try {
@@ -93,6 +103,7 @@ async function api(path, body, { signal, raw } = {}) {
     if (r.status === 409 && j.code === "dbchanged") dbChanged();
     throw err;
   }
+  if (path !== "query" && path !== "cells") { unpackRows(j.rows); unpackRow(j.row); unpackRows(j.updated); unpackRows(j.inserted); }
   return j;
 }
 
@@ -398,6 +409,17 @@ class Grid {
   }
 
   get rh() { return ROW_HEIGHTS[this.rhIndex]; }
+
+  // Columns (besides the frozen first one) that overlap the visible width,
+  // plus a margin: only these get cells, so wide tables stay fast.
+  colRange() {
+    const cols = this.cols, sc = this.sc;
+    const x0 = sc.scrollLeft - 240, x1 = sc.scrollLeft + sc.clientWidth + 240;
+    let a = 1, b = cols.length - 1;
+    while (a <= b && this.lefts[a] + cols[a].width < x0) a++;
+    while (b >= a && this.lefts[b] > x1) b--;
+    return [a, b];
+  }
   get rnw() { return this.o.pick ? Math.max(66, String(this.o.source.count()).length * 7 + 46) : Math.max(52, String(this.o.source.count()).length * 7 + 26); }
 
   setCols(cols) { this.cols = cols; this.renderHead(); this.layout(); this.draw(true); }
@@ -436,24 +458,29 @@ class Grid {
 
   draw(force) {
     const [first, last] = this.range();
+    const [ca, cb] = this.colRange();
     const src = this.o.source;
     if (last >= first) src.ensure(Math.max(0, first - 20), last + 40);
-    if (!force && this.drawn && this.drawn[0] === first && this.drawn[1] === last) return;
-    this.drawn = [first, last];
+    const d = this.drawn;
+    if (!force && d && d[0] === first && d[1] === last && d[2] === ca && d[3] === cb) return;
+    this.drawn = [first, last, ca, cb];
     const rh = this.rh, tall = this.rhIndex > 0, cols = this.cols;
     const now = performance.now();
+    const cell = (r, c, row) => {
+      const col = cols[c];
+      const fl = this.flashes.get(r + ":" + col.name);
+      const cls = (c === 0 ? " g-f0" : "") + (col.readonly ? " ro" : "") + (fl && fl > now ? " flash" : "");
+      const v = row && row[col.idx];
+      return `<div class="g-c${cls}" data-c="${c}" style="grid-column:${c + 2}" role="gridcell">${row ? renderValue(col, isCut(row, col.idx) ? v + "…" : v, tall) : `<span class="skel" style="width:${40 + ((r * 7 + c * 13) % 45)}%"></span>`}</div>`;
+    };
     let h = "";
     for (let r = first; r <= last; r++) {
       const row = src.get(r);
       h += `<div class="g-row rh${this.rhIndex + 1}" data-r="${r}" style="top:${r * rh}px" role="row">`;
-      h += `<div class="g-c g-rn">${this.o.pick ? `<button class="ck" data-pick tabindex="-1" aria-label="Select row"><span class="box"></span></button>` : ""}<span class="num">${r + 1}</span>${this.o.onExpand ? `<button class="xp" data-exp tabindex="-1" title="Expand record (Space)">${icon("i-expand", "sm")}</button>` : ""}</div>`;
-      for (let c = 0; c < cols.length; c++) {
-        const col = cols[c];
-        const fl = this.flashes.get(r + ":" + col.name);
-        const cls = (c === 0 ? " g-f0" : "") + (col.readonly ? " ro" : "") + (fl && fl > now ? " flash" : "");
-        h += `<div class="g-c${cls}" data-c="${c}" role="gridcell">${row ? renderValue(col, row[col.idx], tall) : `<span class="skel" style="width:${40 + ((r * 7 + c * 13) % 45)}%"></span>`}</div>`;
-      }
-      h += `<div class="g-c g-fill"></div></div>`;
+      h += `<div class="g-c g-rn" style="grid-column:1">${this.o.pick ? `<button class="ck" data-pick tabindex="-1" aria-label="Select row"><span class="box"></span></button>` : ""}<span class="num">${r + 1}</span>${this.o.onExpand ? `<button class="xp" data-exp tabindex="-1" title="Expand record (Space)">${icon("i-expand", "sm")}</button>` : ""}</div>`;
+      if (cols.length) h += cell(r, 0, row);
+      for (let c = ca; c <= cb; c++) h += cell(r, c, row);
+      h += `<div class="g-c g-fill" style="grid-column:${cols.length + 2}"></div></div>`;
     }
     if (this.o.onAdd) h += `<div class="g-add" style="top:${src.count() * rh}px"><button data-add>${icon("i-plus", "sm")}Add record</button></div>`;
     this.body.innerHTML = h;
@@ -494,12 +521,24 @@ class Grid {
     this.o.onPick && this.o.onPick(this.picked);
   }
 
+  // Large selections recompute the footer once the selection settles,
+  // not on every mouse move of a drag.
   updateFoot() {
+    clearTimeout(this.footT);
+    const s = this.norm();
+    if (s && (s.r1 - s.r0 + 1) * (s.c1 - s.c0 + 1) > 5000) this.footT = setTimeout(() => this.paintFoot(), 120);
+    else this.paintFoot();
+  }
+
+  paintFoot() {
     let h = this.o.status ? this.o.status() : "";
     const s = this.norm();
     if (s && (s.r1 > s.r0 || s.c1 > s.c0)) {
       const cells = (s.r1 - s.r0 + 1) * (s.c1 - s.c0 + 1);
+      // Whole numbers add up exactly with BigInt: bigint ids and amounts
+      // beyond 2^53 would otherwise be rounded.
       let sum = 0, cnt = 0, min = Infinity, max = -Infinity, filled = 0;
+      let isum = 0n, imin = null, imax = null, ints = true;
       const src = this.o.source;
       for (let r = s.r0; r <= Math.min(s.r1, s.r0 + 50000); r++) {
         const row = src.get(r);
@@ -509,13 +548,21 @@ class Grid {
           if (v != null) filled++;
           if (this.cols[c].kind === "num" && v != null) {
             const x = parseFloat(v);
-            if (!isNaN(x)) { sum += x; cnt++; min = Math.min(min, x); max = Math.max(max, x); }
+            if (isNaN(x)) continue;
+            sum += x; cnt++; min = Math.min(min, x); max = Math.max(max, x);
+            if (ints && /^-?\d+$/.test(v)) {
+              const b = BigInt(v);
+              isum += b;
+              if (imin === null || b < imin) imin = b;
+              if (imax === null || b > imax) imax = b;
+            } else ints = false;
           }
         }
       }
       const f = (x) => x.toLocaleString(undefined, { maximumFractionDigits: 4 });
       h = `<span><b>${fmtN(cells)}</b> cells selected</span><span><b>${fmtN(filled)}</b> not null</span>`;
-      if (cnt) h += `<span>Sum <b>${f(sum)}</b></span><span>Average <b>${f(sum / cnt)}</b></span><span>Min <b>${f(min)}</b></span><span>Max <b>${f(max)}</b></span>`;
+      if (cnt && ints) h += `<span>Sum <b>${isum.toLocaleString()}</b></span><span>Average <b>${f(Number(isum) / cnt)}</b></span><span>Min <b>${imin.toLocaleString()}</b></span><span>Max <b>${imax.toLocaleString()}</b></span>`;
+      else if (cnt) h += `<span>Sum <b>${f(sum)}</b></span><span>Average <b>${f(sum / cnt)}</b></span><span>Min <b>${f(min)}</b></span><span>Max <b>${f(max)}</b></span>`;
     }
     this.foot.innerHTML = h;
   }
@@ -584,7 +631,7 @@ class Grid {
         const c = +rs.parentElement.dataset.c, col = this.cols[c];
         const x0 = e.clientX, w0 = col.width;
         rs.classList.add("drag");
-        const mv = (ev) => { col.width = Math.max(60, Math.min(900, w0 + ev.clientX - x0)); this.layout(); };
+        const mv = (ev) => { col.width = Math.max(60, Math.min(900, w0 + ev.clientX - x0)); this.layout(); this.draw(); };
         const up = () => { rs.classList.remove("drag"); removeEventListener("mousemove", mv); removeEventListener("mouseup", up); this.o.onResize && this.o.onResize(col); };
         addEventListener("mousemove", mv); addEventListener("mouseup", up);
       }
@@ -744,18 +791,22 @@ class Grid {
     }
   }
 
-  copy() {
+  async copy() {
     const s = this.norm();
     if (!s) return;
-    const out = [];
-    let missing = 0;
-    for (let r = s.r0; r <= s.r1; r++) {
-      const row = this.o.source.get(r);
-      if (!row) { missing++; continue; }
-      const line = [];
-      for (let c = s.c0; c <= s.c1; c++) line.push(row[this.cols[c].idx]);
-      out.push(line);
+    const cols = this.cols.slice(s.c0, s.c1 + 1);
+    let rows = [], missing = 0;
+    if (this.o.copyRows) {
+      // The view loads rows not on screen yet and the full text of cut cells.
+      rows = await this.o.copyRows(s.r0, s.r1, cols);
+      if (!rows) return;
+    } else {
+      for (let r = s.r0; r <= s.r1; r++) {
+        const row = this.o.source.get(r);
+        if (row) rows.push(row); else missing++;
+      }
     }
+    const out = rows.map((row) => cols.map((c) => row[c.idx]));
     copyMatrix(out);
     const cells = out.length * (s.c1 - s.c0 + 1);
     toast(cells === 1 ? "Copied" : `Copied ${plural(cells, "cell")}` + (missing ? ` (${fmtN(missing)} rows were not loaded yet)` : ""));
@@ -776,7 +827,20 @@ class Grid {
     if (!readonly && col.kind === "bool") { this.o.onEdit(r, col, isTrue(v) ? "false" : "true", row); return; }
     if (!readonly && col.kind === "enum" && col.enum) { this.enumPicker(r, c, col, v); return; }
     if (readonly && col.kind === "blob") return;
+    if (initial == null && isCut(row, col.idx) && this.o.full) {
+      // The grid has only the start of this value: load all of it first,
+      // so editing never saves a shortened value.
+      this.o.full(row, col).then((full) => {
+        const s2 = this.sel;
+        if (!this.editor && s2 && s2.r2 === r && s2.c2 === c && this.o.source.get(r) === row) this.openEditor(r, c, col, full, null, readonly);
+      }, toastErr);
+      return;
+    }
+    this.openEditor(r, c, col, row, initial, readonly);
+  }
 
+  openEditor(r, c, col, row, initial, readonly) {
+    const v = row[col.idx];
     let text = v ?? "";
     if (readonly && col.kind === "json" && v) text = prettyJSON(v) ?? v;
     const multi = col.kind === "json" || (col.kind === "text" && (/\n/.test(text) || text.length > 40)) || (readonly && text.length > 40);
@@ -1156,7 +1220,8 @@ function paintThemeBtn() {
 
 function route() {
   if (!S.meta || !$("[data-main]")) return;
-  const parts = location.hash.replace(/^#\/?/, "").split("/").map(decodeURIComponent);
+  let parts;
+  try { parts = location.hash.replace(/^#\/?/, "").split("/").map(decodeURIComponent); } catch { parts = []; } // a malformed %-escape
   let next;
   if (parts[0] === "sql") next = { type: "sql" };
   else if (parts[0] === "t" && parts[1] && parts[2]) next = { type: "table", schema: parts[1], name: parts[2], tab: parts[3] === "structure" ? "structure" : "grid" };
@@ -1199,17 +1264,34 @@ function renderEmpty(main) {
 // ============================================================ table view
 
 const PAGE = 200;
+const MAX_PAGES = 60; // pages kept in the browser; the farthest from view are dropped
 
 class RowStore {
   constructor(view) { this.view = view; this.gen = 0; this.reset(); }
   reset() {
     this.gen++;
+    // Requests for the previous query are canceled, which also frees their
+    // database connections on the server.
+    if (this.ctl) this.ctl.abort();
+    this.ctl = new AbortController();
     this.pages = new Map();
     this.inflight = new Map(); // page -> promise
+    this.holds = []; // row ranges an action is loading; never dropped meanwhile
     this.total = 0;
     this.exact = false;
     this.ready = false;
     this.want = null;
+  }
+  evict() {
+    if (this.pages.size <= MAX_PAGES) return;
+    const [a, b] = this.want || [0, 0];
+    const mid = Math.floor((a + b) / 2 / PAGE);
+    const held = (p) => this.holds.some(([x, y]) => p >= Math.floor(x / PAGE) && p <= Math.floor(y / PAGE));
+    const far = [...this.pages.keys()].filter((p) => Math.abs(p - mid) > 2 && !held(p)).sort((x, y) => Math.abs(y - mid) - Math.abs(x - mid));
+    for (const p of far) {
+      if (this.pages.size <= MAX_PAGES) break;
+      this.pages.delete(p);
+    }
   }
   count() { return this.total; }
   get(i) { const p = this.pages.get(Math.floor(i / PAGE)); return p ? p[i % PAGE] : undefined; }
@@ -1230,23 +1312,30 @@ class RowStore {
   // reset meanwhile or a page failed to load.
   async loadRange(a, b) {
     const gen = this.gen;
-    for (let p = Math.floor(a / PAGE); p <= Math.floor(b / PAGE); p++) {
-      if (this.exact && p * PAGE >= this.total) break;
-      if (!this.pages.has(p)) {
-        if (!this.inflight.has(p)) this.inflight.set(p, this.fetch(p));
-        await this.inflight.get(p);
+    const hold = [a, b];
+    this.holds.push(hold);
+    try {
+      for (let p = Math.floor(a / PAGE); p <= Math.floor(b / PAGE); p++) {
+        if (this.exact && p * PAGE >= this.total) break;
+        if (!this.pages.has(p)) {
+          if (!this.inflight.has(p)) this.inflight.set(p, this.fetch(p));
+          await this.inflight.get(p);
+        }
+        if (gen !== this.gen || !this.pages.has(p)) return false;
       }
-      if (gen !== this.gen || !this.pages.has(p)) return false;
+      return true;
+    } finally {
+      this.holds = this.holds.filter((h) => h !== hold);
     }
-    return true;
   }
   async fetch(p) {
     const gen = this.gen;
     this.view.loading(true);
     try {
-      const res = await api("rows", { ...this.view.query(), offset: p * PAGE, limit: PAGE });
+      const res = await api("rows", { ...this.view.query(), offset: p * PAGE, limit: PAGE }, { signal: this.ctl.signal });
       if (gen !== this.gen) return;
       this.pages.set(p, res.rows);
+      this.evict();
       this.view.lastMs = res.ms;
       if (res.rows.length < PAGE) {
         const t = p * PAGE + res.rows.length;
@@ -1271,7 +1360,7 @@ class RowStore {
     const q = this.view.query();
     const first = this.fetch(0);
     this.inflight.set(0, first);
-    api("count", q).then((r) => {
+    api("count", q, { signal: this.ctl.signal }).then((r) => {
       if (gen !== this.gen) return;
       if (this.exact && r.exact) { this.total = r.count; }
       else if (!this.exact || r.exact) { this.total = r.count; this.exact = r.exact; }
@@ -1402,6 +1491,8 @@ class TableView {
       onPick: (set) => this.paintTools(set),
       suggest: (col, q) => this.suggest(col, q),
       status: () => this.status(),
+      full: (row, col) => fullRow(this.meta, row, { names: [col.name], key: this.resolveKey(this.keyOf(row)) }),
+      copyRows: (r0, r1, cols) => this.copyRows(r0, r1, cols),
     });
     this.grid.setCols(this.columns());
     this.paintTools(this.grid.picked);
@@ -1487,11 +1578,12 @@ class TableView {
       $("[data-del]", t).onclick = () => this.deletePicked();
       $("[data-dup]", t).onclick = () => this.duplicatePicked();
       $("[data-clear]", t).onclick = () => { this.grid.picked.clear(); this.grid.paintSel(); };
-      $("[data-copykeys]", t).onclick = () => {
+      $("[data-copykeys]", t).onclick = async () => {
         const cols = this.grid.cols;
-        const out = [cols.map((c) => c.name)];
-        [...this.grid.picked].sort((a, b) => a - b).forEach((r) => { const row = this.rows.get(r); if (row) out.push(cols.map((c) => row[c.idx])); });
-        copyMatrix(out); toast(`Copied ${plural(out.length - 1, "record")}`);
+        const rows = await this.rowsAt([...this.grid.picked].sort((a, b) => a - b), cols, "copy");
+        if (!rows) return;
+        copyMatrix([cols.map((c) => c.name), ...rows.map((row) => cols.map((c) => row[c.idx]))]);
+        toast(`Copied ${plural(rows.length, "record")}`);
       };
       return;
     }
@@ -1812,13 +1904,25 @@ class TableView {
     const idx = (n) => cols.findIndex((c) => c.name === n) + this.offset;
     const seen = (ch) => Object.fromEntries(Object.keys(ch.values).map((n) => [n, ch.row[idx(n)]]));
     const keys = changes.map((ch) => this.resolveKey(this.keyOf(ch.row)));
+    // A cut cell being overwritten was never seen in full. Load its full
+    // value, checking it still is what the grid showed, so the server's
+    // conflict check and undo get the whole value.
+    try {
+      const full = await fullRows(this.meta, changes.map((ch) => ch.row), { names: (k) => Object.keys(changes[k].values), keys, check: true });
+      changes = changes.map((ch, k) => full[k] === ch.row ? ch : { ...ch, row: full[k] });
+    } catch (e) {
+      changes.forEach((ch, i) => { const r = this.locate(keys[i], ch.r); if (r >= 0 && this.grid) this.grid.markErr(r, Object.keys(ch.values)[0]); });
+      toastErr(e);
+      return false;
+    }
     const updates = changes.map((ch, i) => ({ key: keys[i], values: ch.values, expect: seen(ch) }));
     // Show the new values right away; remember what was there to put it back on failure.
     const shown = changes.map((ch, i) => {
       const r = this.locate(keys[i], ch.r);
       if (r < 0) return null;
       const prev = this.rows.get(r), opt = prev.slice();
-      for (const [n, v] of Object.entries(ch.values)) opt[idx(n)] = v;
+      if (prev.cut) opt.cut = { ...prev.cut };
+      for (const [n, v] of Object.entries(ch.values)) { opt[idx(n)] = v; if (opt.cut) delete opt.cut[idx(n)]; }
       this.rows.set(r, opt);
       return { prev };
     });
@@ -1829,7 +1933,8 @@ class TableView {
         const names = Object.keys(changes[i].values);
         this.noteRename(keys[i], this.keyOf(row));
         const r = this.putRow(keys[i], row, changes[i].r, names);
-        return { r, key: this.keyOf(row), old: seen(changes[i]), now: Object.fromEntries(names.map((n) => [n, row[idx(n)]])) };
+        // A value the server returned cut is remembered by its hash.
+        return { r, key: this.keyOf(row), old: seen(changes[i]), now: Object.fromEntries(names.map((n) => [n, isCut(row, idx(n)) ? { hash: row.cut[idx(n)] } : row[idx(n)]])) };
       });
       this.pushUndo({ rows: undoRows, created: res.inserted.map((row) => this.keyOf(row)), label });
       if (this.grid) this.grid.draw(true);
@@ -1875,7 +1980,13 @@ class TableView {
     const keys = rows.map((x) => this.resolveKey(x.key));
     const created = (u.created || []).map((k) => this.resolveKey(k));
     try {
-      const res = await api("batch", { schema: this.meta.schema, name: this.meta.name, updates: rows.map((x, i) => ({ key: keys[i], values: x.old, expect: x.now })), inserts: [], deletes: created });
+      // Values this change left too long to keep come back in full, if
+      // they still have the hash the change produced.
+      const hashed = rows.map((x, i) => ({ i, names: Object.keys(x.now).filter((n) => x.now[n] && typeof x.now[n] === "object") })).filter((h) => h.names.length);
+      const got = await fullCells(this.meta, hashed.map((h) => ({ key: keys[h.i], names: h.names, hashes: Object.fromEntries(h.names.map((n) => [n, rows[h.i].now[n].hash])) })));
+      const now = rows.map((x) => ({ ...x.now }));
+      hashed.forEach((h, k) => Object.assign(now[h.i], got[k]));
+      const res = await api("batch", { schema: this.meta.schema, name: this.meta.name, updates: rows.map((x, i) => ({ key: keys[i], values: x.old, expect: now[i] })), inserts: [], deletes: created });
       res.updated.forEach((row, i) => {
         this.noteRename(keys[i], this.keyOf(row));
         this.putRow(keys[i], row, rows[i].r, Object.keys(rows[i].old));
@@ -2002,6 +2113,24 @@ class TableView {
     return list.map((r) => this.rows.get(r)).filter(Boolean).map((row) => this.resolveKey(this.keyOf(row)));
   }
 
+  // Rows at these positions, loaded, with the full text of cut cells in cols.
+  async rowsAt(list, cols, what) {
+    if (!list.length) return [];
+    if (list.length > 10000) { toast(`${what[0].toUpperCase() + what.slice(1)} up to 10,000 rows at a time`); return null; }
+    if (!(await this.loadRows(list[0], list[list.length - 1], what))) return null;
+    const rows = list.map((r) => this.rows.get(r)).filter(Boolean);
+    try {
+      return await fullRows(this.meta, rows, { names: cols.map((c) => c.name), keys: rows.map((row) => this.resolveKey(this.keyOf(row))) });
+    } catch (e) { toastErr(e); return null; }
+  }
+
+  copyRows(r0, r1, cols) {
+    const list = [];
+    for (let r = r0; r <= Math.min(r1, r0 + 10000); r++) list.push(r);
+    if (r1 - r0 + 1 > 10000) { toast("Copy up to 10,000 rows at a time"); return null; }
+    return this.rowsAt(list, cols, "copy");
+  }
+
   async deleteRows(list) {
     const keys = await this.keysAt(list, "delete");
     if (!keys || !keys.length) return;
@@ -2122,6 +2251,70 @@ async function cachedMeta(schema, name) {
   return metaCache.get(k);
 }
 
+// ---------- full values of cut cells
+
+const CHANGED_MSG = "The record was changed or deleted by someone else since you loaded it; nothing was changed. Refresh to see the current values";
+
+// Loads the full text of cells. items: [{ key, names, hashes }]. With
+// hashes ({ name: md5 }), a value whose hash differs, or a record that is
+// gone, fails like a conflicting edit: the user never saw that value.
+async function fullCells(meta, items) {
+  if (!items.length) return [];
+  const out = [];
+  for (let at = 0; at < items.length; at += 500) {
+    const part = items.slice(at, at + 500);
+    const cols = [...new Set(part.flatMap((it) => it.names))];
+    const res = await api("cells", { schema: meta.schema, name: meta.name, keys: part.map((it) => it.key), cols });
+    part.forEach((it, i) => {
+      const got = res.rows[i];
+      if (!got) throw new ApiError({ error: CHANGED_MSG }, 409);
+      const vals = {};
+      for (const n of it.names) {
+        const j = cols.indexOf(n);
+        if (it.hashes && n in it.hashes && got.hashes[j] !== it.hashes[n]) throw new ApiError({ error: CHANGED_MSG }, 409);
+        vals[n] = got.values[j];
+      }
+      out.push(vals);
+    });
+  }
+  return out;
+}
+
+// Copies of rows with the full text of their cut cells among names (an
+// array, or a function of the row's position; all cut cells when omitted).
+// keys default to the rows' own keys. Rows with nothing to load are
+// returned as they are.
+async function fullRows(meta, rows, { names, keys, check } = {}) {
+  const off = meta.keyMode === "ctid" ? 1 : 0;
+  const nameAt = (i) => meta.columns[i - off].name;
+  const need = [];
+  rows.forEach((row, k) => {
+    if (!row || !row.cut) return;
+    const want = typeof names === "function" ? names(k) : names;
+    const idx = Object.keys(row.cut).map(Number).filter((i) => !want || want.includes(nameAt(i)));
+    if (idx.length) need.push({ k, idx });
+  });
+  if (!need.length) return rows;
+  const got = await fullCells(meta, need.map(({ k, idx }) => ({
+    key: keys ? keys[k] : keyFor(meta, rows[k]),
+    names: idx.map(nameAt),
+    hashes: check ? Object.fromEntries(idx.map((i) => [nameAt(i), rows[k].cut[i]])) : null,
+  })));
+  const out = rows.slice();
+  need.forEach(({ k, idx }, n) => {
+    const row = rows[k], copy = row.slice(), cut = { ...row.cut };
+    idx.forEach((i) => { copy[i] = got[n][nameAt(i)]; delete cut[i]; });
+    if (Object.keys(cut).length) copy.cut = cut;
+    out[k] = copy;
+  });
+  return out;
+}
+
+async function fullRow(meta, row, { names, key, check } = {}) {
+  if (!row || !row.cut) return row;
+  return (await fullRows(meta, [row], { names, keys: key ? [key] : null, check }))[0];
+}
+
 async function openLinked(fk, value) {
   try {
     const meta = await cachedMeta(fk.schema, fk.table);
@@ -2163,10 +2356,21 @@ function drawerRowChanged(view, oldKey, row) {
   const top = drawer.stack[drawer.stack.length - 1];
   if (top.view !== view || top.isNew || !top.row) return;
   if (JSON.stringify(keyFor(top.meta, top.row)) !== JSON.stringify(oldKey)) return;
-  if (!drawer.dirty()) { top.row = row; drawer.render(); }
+  if (drawer.dirty()) return;
+  fullRow(top.meta, row).then((full) => {
+    if (drawer && drawer.stack[drawer.stack.length - 1] === top && !drawer.dirty()) { top.row = full; drawer.render(); }
+  }, () => {});
+}
+
+// The drawer shows and edits whole values, never the grid's cut ones.
+async function fillEntry(entry) {
+  const key = (row) => entry.view ? entry.view.resolveKey(keyFor(entry.meta, row)) : undefined;
+  if (entry.row) entry.row = await fullRow(entry.meta, entry.row, { key: key(entry.row) });
+  if (entry.copyOf) entry.copyOf = { ...entry.copyOf, row: await fullRow(entry.meta, entry.copyOf.row, { key: key(entry.copyOf.row) }) };
 }
 
 async function openRecord(entry) {
+  try { await fillEntry(entry); } catch (e) { toastErr(e); return; }
   if (!drawer) {
     const scrim = html(`<div class="scrim"></div>`);
     const el = html(`<aside class="drawer" role="dialog" aria-modal="true" aria-label="Record"></aside>`);
@@ -2213,7 +2417,8 @@ function renderRecord() {
     const orig = blank ? undefined : row[i + off];
     // On a copy, these get fresh values from the database instead of the original's.
     const selfFill = !!copy && !!(c.identity || c.generated || (c.pk && c.default));
-    const ro = !editable || c.generated === "s" || (c.identity === "a") || kind === "blob" || (blank && (c.identity || c.generated)) || selfFill;
+    // A value still cut (should not happen) is shown but never edited.
+    const ro = !editable || c.generated === "s" || (c.identity === "a") || kind === "blob" || (blank && (c.identity || c.generated)) || selfFill || isCut(row, i + off);
     const f = { c, kind, orig, val: orig === undefined ? null : orig, touched: false, ro, selfFill, copied: !!copy };
     if (kind === "json" && orig != null) { const p = prettyJSON(orig); if (p != null) { f.pretty = p; f.val = p; } }
     f.changed = () => blank ? f.touched : f.val !== (f.pretty ?? f.orig);
@@ -2301,8 +2506,9 @@ function renderRecord() {
     const at = e.view.locate(e.view.resolveKey(keyFor(meta, e.row)), e.r);
     if (at < 0) return;
     const r = at + d;
-    const nr = e.view.rows.get(r);
+    let nr = e.view.rows.get(r);
     if (r < 0 || !nr) return;
+    try { nr = await fullRow(meta, nr, { key: e.view.resolveKey(keyFor(meta, nr)) }); } catch (er) { toastErr(er); return; }
     e.r = r; e.row = nr;
     e.view.grid.select(r, e.view.grid.sel ? e.view.grid.sel.c2 : 0);
     renderRecord();
@@ -2405,7 +2611,8 @@ async function saveRecord() {
         : await api("insert", { schema: meta.schema, name: meta.name, values });
       toast(e.copyOf ? "Copy created" : "Record created");
       if (e.view && e.view.grid) e.view.pushUndo({ created: [keyFor(meta, res.row)], label: e.copyOf ? "duplicate" : "add" });
-      e.isNew = false; e.copyOf = null; e.row = res.row; e.r = null;
+      e.isNew = false; e.copyOf = null; e.row = await fullRow(meta, res.row).catch(() => null); e.r = null;
+      if (!e.row) { closeDrawer(true); return; }
       if (e.view && e.view.grid) e.view.refresh(true);
       renderRecord();
     } else {
@@ -2427,6 +2634,9 @@ async function saveRecord() {
           if (v.grid) { Object.keys(values).forEach((n) => v.grid.flash(r, n)); v.grid.draw(true); }
         }
       }
+      // The saved row comes back with long values cut; the drawer needs them whole.
+      try { e.row = await fullRow(meta, res.row); } catch { closeDrawer(true); return; }
+      if (!drawer || drawer.stack[drawer.stack.length - 1] !== e) return;
       renderRecord();
     }
   } catch (er) {
@@ -2610,7 +2820,8 @@ class SqlView {
     }
     csv.hidden = !cur || !cur.columns;
     if (cur && cur.columns) {
-      stat.textContent = `${plural(cur.rows.length, "row")}${cur.truncated ? " (only the first 10,000 are shown)" : ""}  ·  ${res.ms} ms${tags.length ? "  ·  " + tags.join(", ") : ""}`;
+      const count = cur.truncated ? `${plural(cur.total, "row")}, showing the first ${fmtN(cur.rows.length)}` : plural(cur.rows.length, "row");
+      stat.textContent = `${count}  ·  ${res.ms} ms${tags.length ? "  ·  " + tags.join(", ") : ""}`;
       out.innerHTML = errHTML + `<div class="grid-wrap" data-gw></div>`;
       const cols = cur.columns.map((c, k) => {
         const kind = kindFromTypeName(c.type);

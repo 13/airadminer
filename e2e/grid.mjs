@@ -150,7 +150,7 @@ const tests = {
       await open_("${sc}", "items");
       const c = col("t");
       S.view.grid.sel = { r: 0, c, r2: 1, c2: c };
-      S.view.grid.copy();
+      await S.view.grid.copy();
       await S.view.paste({ r0: 2, r1: 2, c0: c, c1: c }, pastedMatrix(lastCopy.text));
       const rows = await sql("SELECT id, t IS NULL, t FROM ${sc}.items WHERE id IN (3, 4) ORDER BY id");
       if (JSON.stringify(rows) !== JSON.stringify([["3", "t", null], ["4", "f", "x"]])) throw new Error(JSON.stringify(rows));
@@ -212,6 +212,110 @@ const tests = {
       if (!rows[0][1].includes("12345678901234567890")) throw new Error("JSON changed: " + rows[0][1]);
       if (S.view.rows.get(9)[1] !== "orig") throw new Error("the row now at position 9 was repainted");
       await closeDrawer(true);
+    `);
+  },
+
+  async "a long value cut in the grid is edited, copied, pasted over and undone in full"(sc) {
+    return run(`
+      await sql("CREATE TABLE ${sc}.items (id int PRIMARY KEY, doc text); INSERT INTO ${sc}.items VALUES (1, repeat('ab', 20000)), (2, 'short')");
+      await open_("${sc}", "items");
+      const g = S.view.grid, c = col("doc");
+      const dbDoc = async (id) => (await sql("SELECT doc FROM ${sc}.items WHERE id = " + id))[0][0];
+      const row = S.view.rows.get(0);
+      if (!row.cut || row[1].length > 8192) throw new Error("value not cut: " + row[1].length);
+      if (!g.cellEl(0, c).textContent.endsWith("…")) throw new Error("cut value not marked");
+      // in-cell editor opens with the whole value
+      g.select(0, c); g.startEdit();
+      await until(() => g.editor, "editor");
+      if (g.editor.input.value.length !== 40000) throw new Error("editor got " + g.editor.input.value.length + " characters");
+      g.editor.input.value += "X"; g.commitEdit();
+      await until(async () => (await dbDoc(1)).length === 40001, "edit saved");
+      await S.view.writeChain;
+      // record form
+      S.view.expand(0);
+      await until(() => drawer && drawer.fields, "record form");
+      if (drawer.fields.find((f) => f.c.name === "doc").val.length !== 40001) throw new Error("form shows a cut value");
+      await closeDrawer(true);
+      // copy
+      g.sel = { r: 0, c, r2: 0, c2: c };
+      await g.copy();
+      if (lastCopy.matrix[0][0].length !== 40001) throw new Error("copied " + lastCopy.matrix[0][0].length + " characters");
+      // paste over it, then undo restores all of it
+      await S.view.paste({ r0: 0, r1: 0, c0: c, c1: c }, [["pasted"]]);
+      if (await dbDoc(1) !== "pasted") throw new Error("paste not saved");
+      await S.view.undoLast();
+      const back = await dbDoc(1);
+      if (back.length !== 40001 || !back.endsWith("X")) throw new Error("undo restored " + back.length + " characters");
+      // a long value written by the grid comes back cut; undo still works
+      if (!(await S.view.writeCell(1, "doc", "z".repeat(30000)))) throw new Error("long write failed");
+      if (!S.view.rows.get(S.view.locate({ id: "2" })).cut) throw new Error("written value not cut");
+      await S.view.undoLast();
+      if (await dbDoc(2) !== "short") throw new Error("undo of a long write: " + (await dbDoc(2)).slice(0, 20));
+      // overwriting a cut value someone else changed meanwhile is refused
+      S.view.refresh(true);
+      await until(() => S.view.rows.get(0) && S.view.rows.get(0).cut, "reloaded");
+      await sql("UPDATE ${sc}.items SET doc = repeat('cd', 20000) WHERE id = 1");
+      await S.view.paste({ r0: 0, r1: 0, c0: c, c1: c }, [["mine"]]);
+      if (!(await dbDoc(1)).startsWith("cdcd")) throw new Error("overwrote a concurrent change");
+    `);
+  },
+
+  async "pages far from view are dropped and load again"(sc) {
+    return run(`
+      await sql("CREATE TABLE ${sc}.items (id int PRIMARY KEY, v text); INSERT INTO ${sc}.items SELECT g, 'v' || g FROM generate_series(1, 20000) g");
+      await open_("${sc}", "items");
+      const g = S.view.grid;
+      for (let r = 0; r < 18000; r += 200) {
+        g.sc.scrollTop = r * g.rh; g.draw();
+        await until(() => S.view.rows.get(r), "row " + r);
+      }
+      const kept = S.view.rows.pages.size;
+      if (kept > 62) throw new Error(kept + " pages kept");
+      if (S.view.rows.get(0)) throw new Error("first page was not dropped");
+      g.sc.scrollTop = 0; g.draw();
+      await until(() => S.view.rows.get(0) && S.view.rows.get(0)[1] === "v1", "first page again");
+    `);
+  },
+
+  async "a wide table draws only the columns in view"(sc) {
+    return run(`
+      await sql("DO $$ BEGIN EXECUTE (SELECT 'CREATE TABLE ${sc}.wide (id int PRIMARY KEY, ' || string_agg('c' || g || ' int DEFAULT ' || g, ', ') || ')' FROM generate_series(1, 300) g); END $$; INSERT INTO ${sc}.wide (id) VALUES (1)");
+      await open_("${sc}", "wide");
+      const g = S.view.grid;
+      await until(() => g.cellEl(0, 1), "first row");
+      const n = document.querySelectorAll('.g-row[data-r="0"] .g-c[data-c]').length;
+      if (n > 40) throw new Error(n + " cells drawn for one row");
+      g.sc.scrollLeft = g.lefts[250]; g.draw();
+      await until(() => g.cellEl(0, 250), "column 250");
+      if (g.cellEl(0, 250).textContent.trim() !== "250") throw new Error("column 250 shows " + g.cellEl(0, 250).textContent);
+      if (!g.cellEl(0, 0)) throw new Error("frozen first column missing");
+      g.select(0, 299);
+      await until(() => g.cellEl(0, 299), "last column after keyboard move");
+    `);
+  },
+
+  async "the footer adds big integers exactly"(sc) {
+    return run(`
+      await sql("CREATE TABLE ${sc}.items (id int PRIMARY KEY, n bigint); INSERT INTO ${sc}.items VALUES (1, 9007199254740993), (2, 1)");
+      await open_("${sc}", "items");
+      const g = S.view.grid, c = col("n");
+      g.sel = { r: 0, c, r2: 1, c2: c }; g.paintFoot();
+      const want = (9007199254740994n).toLocaleString();
+      if (!g.foot.textContent.includes("Sum " + want)) throw new Error(g.foot.textContent);
+    `);
+  },
+
+  async "a malformed link and quick filter changes cause no errors"(sc) {
+    return run(`
+      await sql("CREATE TABLE ${sc}.items (id int PRIMARY KEY, v text); INSERT INTO ${sc}.items SELECT g, 'v' || g FROM generate_series(1, 5000) g");
+      location.hash = "#/t/%E0%A4%A/x";
+      await new Promise((r) => setTimeout(r, 200));
+      await open_("${sc}", "items");
+      for (let i = 0; i < 8; i++) { S.view.settings.search = "v" + i; S.view.refresh(); }
+      await until(() => S.view.rows.ready && S.view.rows.get(0), "filtered rows");
+      await new Promise((r) => setTimeout(r, 300));
+      if (document.querySelector(".toast.err")) throw new Error(document.querySelector(".toast.err").textContent);
+      if (S.view.rows.get(0)[1] !== "v7") throw new Error("shows " + S.view.rows.get(0)[1]);
     `);
   },
 };
