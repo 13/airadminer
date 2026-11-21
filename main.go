@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -29,6 +30,14 @@ type config struct {
 	dsn      string
 	readonly bool
 	auth     string // "user:pass" for HTTP basic auth, optional
+
+	allowHosts       string // login screen: database hosts that may be reached
+	allowSocket      bool   // login screen: allow unix-socket hosts
+	requireTLS       bool   // login screen: never connect without TLS
+	maxSessions      int
+	poolSize         int
+	statementTimeout time.Duration
+	lockTimeout      time.Duration
 }
 
 func main() {
@@ -37,6 +46,13 @@ func main() {
 	flag.StringVar(&cfg.dsn, "dsn", envOr("DATABASE_URL", ""), "connect to this database for everyone and skip the login screen (env DATABASE_URL)")
 	flag.BoolVar(&cfg.readonly, "readonly", envOr("AIRADMINER_READONLY", "") != "", "open every connection with default_transaction_read_only=on (env AIRADMINER_READONLY)")
 	flag.StringVar(&cfg.auth, "auth", envOr("AIRADMINER_AUTH", ""), "require HTTP basic auth, as user:password (env AIRADMINER_AUTH)")
+	flag.StringVar(&cfg.allowHosts, "allow-hosts", envOr("AIRADMINER_ALLOW_HOSTS", ""), "login screen: comma-separated database hosts, host:port pairs, IPs or CIDRs that may be reached (default: any host except link-local)")
+	flag.BoolVar(&cfg.allowSocket, "allow-socket", envOr("AIRADMINER_ALLOW_SOCKET", "") != "", "login screen: allow unix-socket hosts (peer authentication then runs as this server's OS user)")
+	flag.BoolVar(&cfg.requireTLS, "require-tls", envOr("AIRADMINER_REQUIRE_TLS", "") != "", "login screen: upgrade sslmode disable/allow/prefer to require")
+	flag.IntVar(&cfg.maxSessions, "max-sessions", envInt("AIRADMINER_MAX_SESSIONS", 64), "most signed-in browser sessions at once")
+	flag.IntVar(&cfg.poolSize, "pool-size", envInt("AIRADMINER_POOL_SIZE", 4), "database connections per session (with -dsn: shared by everyone)")
+	flag.DurationVar(&cfg.statementTimeout, "statement-timeout", envDur("AIRADMINER_STATEMENT_TIMEOUT", 0), "default statement_timeout for every connection (0 = server default)")
+	flag.DurationVar(&cfg.lockTimeout, "lock-timeout", envDur("AIRADMINER_LOCK_TIMEOUT", 30*time.Second), "default lock_timeout for every connection (0 = server default)")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 	if *showVersion {
@@ -45,6 +61,9 @@ func main() {
 	}
 	if cfg.auth != "" && !strings.Contains(cfg.auth, ":") {
 		log.Fatal("-auth must look like user:password")
+	}
+	if cfg.maxSessions < 1 || cfg.poolSize < 1 {
+		log.Fatal("-max-sessions and -pool-size must be at least 1")
 	}
 
 	app := newApp(cfg)
@@ -63,6 +82,9 @@ func main() {
 		Addr:              cfg.addr,
 		Handler:           app.routes(),
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       2 * time.Minute, // request bodies are small; exports stream out, so no WriteTimeout
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    64 << 10,
 	}
 	ln, err := net.Listen("tcp", cfg.addr)
 	if err != nil {
@@ -78,7 +100,8 @@ func main() {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	<-stop
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	log.Printf("shutting down")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(ctx)
 	app.closeAll()
@@ -86,6 +109,10 @@ func main() {
 
 func (a *App) routes() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Write([]byte("ok\n"))
+	})
 	static, _ := fs.Sub(webFS, "web")
 	files := http.FileServer(http.FS(static))
 	mux.Handle("GET /", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -103,6 +130,10 @@ func (a *App) middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// A loopback-only server must only answer to loopback names; this
 		// blocks DNS-rebinding pages from talking to it through the browser.
+		if r.URL.Path == "/healthz" { // liveness probes carry no credentials or loopback Host
+			next.ServeHTTP(w, r)
+			return
+		}
 		if loopbackOnly && !isLoopback(hostOnly(r.Host)) {
 			http.Error(w, "airadminer only answers to localhost on this address", http.StatusMisdirectedRequest)
 			return
@@ -126,6 +157,20 @@ func (a *App) middleware(next http.Handler) http.Handler {
 
 func envOr(k, def string) string {
 	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return def
+}
+
+func envInt(k string, def int) int {
+	if v, err := strconv.Atoi(os.Getenv(k)); err == nil {
+		return v
+	}
+	return def
+}
+
+func envDur(k string, def time.Duration) time.Duration {
+	if v, err := time.ParseDuration(os.Getenv(k)); err == nil {
 		return v
 	}
 	return def

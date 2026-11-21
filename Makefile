@@ -2,7 +2,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 PLATFORMS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64
 
-.PHONY: build run test dist clean demo
+.PHONY: build run test test-integration lint dist clean demo
 
 build:
 	CGO_ENABLED=0 go build -trimpath -ldflags '$(LDFLAGS)' -o airadminer .
@@ -12,8 +12,18 @@ run: build
 
 test:
 	go vet ./...
-	go test ./...
+	go test -race ./...
 	node --check web/app.js
+
+# Needs `make demo` (or any PostgreSQL superuser DSN in AIRADMINER_TEST_DSN)
+test-integration:
+	AIRADMINER_TEST_DSN=$${AIRADMINER_TEST_DSN:-postgres://postgres:secret@127.0.0.1:55432/postgres} go test -race -count=1 ./...
+
+lint:
+	test -z "$$(gofmt -l .)"
+	go vet ./...
+	go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+	go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
 # Static binaries for every platform in ./dist
 dist:

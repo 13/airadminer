@@ -66,6 +66,15 @@ DATABASE_URL=postgres://app@db/app ./airadminer -readonly
 | `-dsn` | `DATABASE_URL` | – | Connect everyone to this database and skip the login screen |
 | `-auth` | `AIRADMINER_AUTH` | – | Require HTTP basic auth, as `user:password` |
 | `-readonly` | `AIRADMINER_READONLY` | off | Open every connection with `default_transaction_read_only=on` and disable editing |
+| `-allow-hosts` | `AIRADMINER_ALLOW_HOSTS` | any host except link-local | Login screen: comma-separated hosts, `host:port` pairs, IPs or CIDRs it may connect to |
+| `-allow-socket` | `AIRADMINER_ALLOW_SOCKET` | off | Login screen: allow unix-socket hosts |
+| `-require-tls` | `AIRADMINER_REQUIRE_TLS` | off | Login screen: upgrade `sslmode` `disable`/`allow`/`prefer` to `require` |
+| `-max-sessions` | `AIRADMINER_MAX_SESSIONS` | `64` | Most signed-in browser sessions at once |
+| `-pool-size` | `AIRADMINER_POOL_SIZE` | `4` | Database connections per session (with `-dsn`, shared by everyone) |
+| `-statement-timeout` | `AIRADMINER_STATEMENT_TIMEOUT` | server default | Default `statement_timeout` for every connection, e.g. `5m` |
+| `-lock-timeout` | `AIRADMINER_LOCK_TIMEOUT` | `30s` | Default `lock_timeout` for every connection |
+
+`GET /healthz` answers `ok` without authentication, for liveness probes.
 
 Without `-dsn`, you see a login screen like Adminer's. Credentials are held in the server's memory for the session, which expires after 12 hours idle, and are never written to disk. Each browser session gets its own small connection pool.
 
@@ -75,11 +84,17 @@ Without `-dsn`, you see a login screen like Adminer's. Credentials are held in t
 - Every API call needs a custom request header, and the session cookie is `HttpOnly` and `SameSite=Strict`. This stops other sites from driving your session (CSRF). A strict Content-Security-Policy blocks inline scripts.
 - **`-dsn` without `-auth` on a non-loopback address gives your database to anyone who can reach the port.** The server prints a warning at startup in that case.
 - `-readonly` is a safety rail, not a security boundary: a user with SQL access can turn it off with `SET`. For real read-only access, connect as a PostgreSQL role that only has `SELECT`.
+- The login screen connects only with what the browser sent. It never fills in a missing password from the server's `PGPASSWORD` or `~/.pgpass`, and it never uses client certificates or service files from the account airadminer runs as. A connection URL may only carry host, port, user, password, database and `sslmode`. If `PGSERVICE` is set, the login screen refuses to connect.
+- Unix-socket hosts are off by default. With peer authentication they would log people in as the OS user airadminer runs as.
+- The login screen can reach any database host the server can reach. On a shared server, limit it with `-allow-hosts`. The check runs on every resolved address at connect time. Link-local addresses, where cloud metadata services live, are refused unless listed.
+- Sign-in attempts are rate-limited per client address (a burst of 10, then one every 6 seconds), and `-max-sessions` caps open sessions and their connection pools.
+- After every SQL editor run, and every grid query with a raw SQL filter, the connection is reset with `DISCARD ALL`. A `SET ROLE`, `SET session_replication_role`, temp table or advisory lock therefore never carries over to later edits. If the reset fails, the connection is closed.
+- Every request names the database its page was built for. If another tab switched the session to a different database, edits are refused (HTTP 409) and the page reloads.
 - For TLS, put the server behind a reverse proxy such as Caddy or nginx. The UI uses relative URLs, so it also works under a sub-path.
 
 ## How editing works
 
-Rows are identified by their primary key. Tables without one fall back to `ctid`, which is fine for quick fixes but can change after `VACUUM FULL`. Views without a primary key are read-only.
+Rows are identified by their primary key. Tables without one fall back to `ctid` together with `xmin`. That pair names one version of one row, so if the row changed, or was deleted and its slot reused by `VACUUM`, the edit is refused instead of landing on another row. Reload the rows and try again. Views without a primary key are read-only.
 
 Values travel as PostgreSQL's own text format in both directions, the same text `psql` shows. Each edit is one `UPDATE … WHERE <key> RETURNING …`. A paste, clear or undo sends all its changes in one transaction. It is rejected if the row no longer matches exactly one record. The cell then shows the value the database returned, so triggers and defaults are reflected right away.
 
@@ -88,7 +103,9 @@ Values travel as PostgreSQL's own text format in both directions, the same text 
 ```sh
 make build      # ./airadminer for this machine
 make dist       # static binaries for linux/darwin/windows × amd64/arm64 in ./dist
-make test       # go vet, go test, JS syntax check
+make test       # go vet, go test -race, JS syntax check
+make lint       # gofmt, vet, staticcheck, govulncheck
+make test-integration  # tests against PostgreSQL (needs `make demo` running)
 make demo       # throwaway Postgres on :55432 with sample data (password: secret)
 ```
 
@@ -97,6 +114,7 @@ Project layout:
 ```
 main.go      flags, HTTP server, security middleware
 session.go   login sessions and connection pools
+login.go     login screen: connection settings, host policy, rate limit
 meta.go      catalog queries: tables, columns, keys, indexes, constraints
 api.go       JSON API: rows, count, update/insert/delete, SQL, CSV export
 web/         the entire UI: index.html, app.css, app.js (no build step)

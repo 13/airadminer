@@ -3,8 +3,11 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestQuoteLiteral(t *testing.T) {
@@ -91,16 +94,124 @@ func TestKeyWhere(t *testing.T) {
 	}
 }
 
-func TestLoginDSN(t *testing.T) {
-	d, err := loginReq{Host: "db", Port: "6543", User: "u", Password: "p@ss/word", Database: "app", SSLMode: "require"}.dsn()
+func TestLoginConfigIgnoresServerEnvironment(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("PGPASSWORD", "from-env")
+	t.Setenv("PGHOST", "envhost")
+	os.WriteFile(filepath.Join(home, ".pgpass"), []byte("*:*:*:*:from-pgpass\n"), 0o600)
+	a := newApp(config{})
+	cfg, err := a.loginConfig(loginReq{Host: "db", Port: "6543", User: "u", Database: "app", SSLMode: "require"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d != "postgres://u:p%40ss%2Fword@db:6543/app?sslmode=require" {
-		t.Fatalf("dsn = %s", d)
+	cc := cfg.ConnConfig
+	if cc.Password != "" || cc.Host != "db" || cc.Port != 6543 || cc.User != "u" || cc.Database != "app" {
+		t.Fatalf("got host=%s port=%d user=%s db=%s password=%q", cc.Host, cc.Port, cc.User, cc.Database, cc.Password)
 	}
-	if _, err := (loginReq{Port: "abc"}).dsn(); err == nil {
-		t.Fatal("expected port error")
+	cfg, err = a.loginConfig(loginReq{Host: "db", User: "u", Password: "p@ss/w'o\\rd"})
+	if err != nil || cfg.ConnConfig.Password != "p@ss/w'o\\rd" {
+		t.Fatalf("password not kept: %v", err)
+	}
+	t.Setenv("PGSERVICE", "prod")
+	if _, err := a.loginConfig(loginReq{Host: "db", User: "u"}); err == nil {
+		t.Fatal("PGSERVICE must make the login screen fail closed")
+	}
+}
+
+func TestLoginConfigRejects(t *testing.T) {
+	a := newApp(config{})
+	bad := []loginReq{
+		{Host: "db", Port: "abc", User: "u"},
+		{Host: "db", Port: "70000", User: "u"},
+		{Host: "db"}, // no user
+		{Host: "db", User: "u", SSLMode: "bogus"},
+		{Host: "/var/run/postgresql", User: "postgres"}, // socket without -allow-socket
+		{Host: "a,b", User: "u"},
+		{URL: "postgres://u@db/app?passfile=/etc/shadow"},
+		{URL: "postgres://u@db/app?sslkey=/home/x/.ssh/id_rsa"},
+		{URL: "postgres://u@db/app?service=prod"},
+		{URL: "host=db user=u"},
+		{URL: "postgres://u@a,b/app"},
+	}
+	for _, r := range bad {
+		if _, err := a.loginConfig(r); err == nil {
+			t.Errorf("accepted %+v", r)
+		}
+	}
+	cfg, err := a.loginConfig(loginReq{URL: "postgresql://u:p%40ss@db:6000/app?sslmode=require"})
+	if err != nil || cfg.ConnConfig.Password != "p@ss" || cfg.ConnConfig.Port != 6000 || cfg.ConnConfig.Database != "app" {
+		t.Fatalf("url login: %v", err)
+	}
+	sock := newApp(config{allowSocket: true})
+	if _, err := sock.loginConfig(loginReq{Host: "/tmp", User: "u"}); err != nil {
+		t.Fatalf("socket with -allow-socket: %v", err)
+	}
+	tls := newApp(config{requireTLS: true})
+	cfg, _ = tls.loginConfig(loginReq{Host: "db", User: "u", SSLMode: "disable"})
+	if cfg.ConnConfig.TLSConfig == nil || len(cfg.ConnConfig.Fallbacks) != 0 {
+		t.Fatal("-require-tls must force TLS without plaintext fallback")
+	}
+}
+
+func TestHostPolicy(t *testing.T) {
+	p, _ := parseHostPolicy("db.internal, pg:6432, 10.0.0.0/8")
+	if p.checkName("db.internal", "5432") != nil || p.checkName("pg", "6432") != nil {
+		t.Fatal("listed names must pass")
+	}
+	if p.checkName("pg", "5432") == nil {
+		// nets are configured, so unlisted names are decided by address
+		ips, err := p.lookup("pg", "5432")(t.Context(), "127.0.0.1")
+		if err == nil {
+			t.Fatalf("127.0.0.1 is not in 10.0.0.0/8: %v", ips)
+		}
+	}
+	if ips, err := p.lookup("x", "5432")(t.Context(), "10.1.2.3"); err != nil || len(ips) != 1 {
+		t.Fatalf("10.1.2.3 must pass: %v", err)
+	}
+	open, _ := parseHostPolicy("")
+	if _, err := open.lookup("m", "80")(t.Context(), "169.254.169.254"); err == nil {
+		t.Fatal("link-local must be refused by default")
+	}
+	if _, err := open.lookup("l", "5432")(t.Context(), "127.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+	only, _ := parseHostPolicy("db.internal")
+	if only.checkName("evil", "5432") == nil {
+		t.Fatal("unlisted name must be refused")
+	}
+}
+
+func TestLoginLimiter(t *testing.T) {
+	l := newLoginLimiter(3, time.Second)
+	now := time.Now()
+	for i := 0; i < 3; i++ {
+		if !l.allow("ip", now) {
+			t.Fatal("burst refused")
+		}
+	}
+	if l.allow("ip", now) {
+		t.Fatal("4th attempt allowed")
+	}
+	if !l.allow("other", now) {
+		t.Fatal("limit must be per client")
+	}
+	if !l.allow("ip", now.Add(time.Second)) {
+		t.Fatal("refill missing")
+	}
+}
+
+func TestKeyWhereCtid(t *testing.T) {
+	m := &TableMeta{Schema: "s", Name: "t", KeyMode: "ctid"}
+	k := "(0,1):1234"
+	args := &sqlArgs{}
+	w, err := keyWhere(m, rowKey{"__ctid": &k}, args)
+	if err != nil || w != "ctid = $1::tid AND xmin = $2::xid" || string(args.vals[0]) != "(0,1)" || string(args.vals[1]) != "1234" {
+		t.Fatalf("keyWhere = %q %q %v", w, args.vals, err)
+	}
+	old := "(0,1)"
+	if _, err := keyWhere(m, rowKey{"__ctid": &old}, &sqlArgs{}); err == nil {
+		t.Fatal("a bare ctid must be refused")
 	}
 }
 

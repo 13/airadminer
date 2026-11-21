@@ -49,12 +49,34 @@ class ApiError extends Error {
   constructor(j, status) { super(j.error || "Request failed"); Object.assign(this, j); this.status = status; }
 }
 
+// Every request names the database the page was built for, so the server
+// can refuse an edit after another tab switched this session elsewhere.
+function apiHeaders(path) {
+  const h = { "Content-Type": "application/json", "X-Airadminer": "1" };
+  if (S.meta && path !== "login" && path !== "meta") h["X-Airadminer-Db"] = encodeURIComponent(S.meta.database);
+  return h;
+}
+
+let reloadingDB = false;
+async function dbChanged() {
+  if (reloadingDB) return;
+  reloadingDB = true;
+  try {
+    S.meta = await api("meta");
+    if (S.view && S.view.destroy) S.view.destroy();
+    S.view = null;
+    location.hash = "";
+    await renderShell();
+    toast(`This session was switched to database ${S.meta.database} in another tab`, { err: true });
+  } catch (e) { toastErr(e); } finally { reloadingDB = false; }
+}
+
 async function api(path, body, { signal, raw } = {}) {
   let r;
   try {
     r = await fetch("api/" + path, {
       method: "POST", credentials: "same-origin", signal,
-      headers: { "Content-Type": "application/json", "X-Airadminer": "1" },
+      headers: apiHeaders(path),
       body: JSON.stringify(body || {}),
     });
   } catch (e) {
@@ -67,6 +89,7 @@ async function api(path, body, { signal, raw } = {}) {
   if (!r.ok) {
     const err = new ApiError(j, r.status);
     if (r.status === 401 && path !== "login") signedOut();
+    if (r.status === 409 && j.code === "dbchanged") dbChanged();
     throw err;
   }
   return j;

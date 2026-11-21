@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -34,7 +36,10 @@ type apiErr struct {
 	Index    *int   `json:"index,omitempty"` // which change of a batch failed
 }
 
-type handler func(s *Session, w http.ResponseWriter, r *http.Request) (any, error)
+// dbHeader carries the database the page was built for (URL-escaped).
+const dbHeader = "X-Airadminer-Db"
+
+type handler func(s *Session, db *DB, w http.ResponseWriter, r *http.Request) (any, error)
 
 func (a *App) registerAPI(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/login", a.guard(a.handleLogin))
@@ -70,11 +75,25 @@ func (a *App) guard(next http.HandlerFunc) http.HandlerFunc {
 func (a *App) authed(h handler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		s := a.sessionFor(r)
-		if s == nil || s.Pool() == nil {
+		var db *DB
+		if s != nil {
+			db = s.current()
+		}
+		if db == nil {
 			writeJSON(w, http.StatusUnauthorized, apiErr{Error: "not signed in", Code: "auth"})
 			return
 		}
-		out, err := h(s, w, r)
+		// The browser names the database its page was built for. If this
+		// session moved to another database since (another tab switched),
+		// refuse instead of applying an edit to a same-named table there.
+		if want, ok := r.Header[dbHeader]; ok {
+			name, err := url.PathUnescape(strings.Join(want, ""))
+			if err != nil || name != db.name {
+				writeJSON(w, http.StatusConflict, apiErr{Error: "this session switched to database " + db.name + "; the page was reloaded", Code: "dbchanged"})
+				return
+			}
+		}
+		out, err := h(s, db, w, r)
 		if err != nil {
 			writeErr(w, err)
 			return
@@ -112,7 +131,22 @@ func writeErr(w http.ResponseWriter, err error) {
 		writeJSON(w, http.StatusGatewayTimeout, apiErr{Error: "query timed out"})
 		return
 	}
+	if isUnavailable(err) {
+		writeJSON(w, http.StatusServiceUnavailable, apiErr{Error: err.Error(), Code: "unavailable"})
+		return
+	}
 	writeJSON(w, http.StatusBadRequest, apiErr{Error: err.Error()})
+}
+
+// isUnavailable reports errors worth retrying: the database could not be
+// reached or the connection broke, as opposed to a rejected statement.
+func isUnavailable(err error) bool {
+	var ce *pgconn.ConnectError
+	if errors.As(err, &ce) || pgconn.SafeToRetry(err) {
+		return true
+	}
+	var ne net.Error
+	return errors.As(err, &ne)
 }
 
 func decode(r *http.Request, v any) error {
@@ -130,19 +164,24 @@ func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 		return
 	}
+	if !a.logins.allow(hostOnly(r.RemoteAddr), time.Now()) {
+		w.Header().Set("Retry-After", "10")
+		writeJSON(w, http.StatusTooManyRequests, apiErr{Error: "too many sign-in attempts; wait a few seconds and try again"})
+		return
+	}
 	var req loginReq
 	if err := decode(r, &req); err != nil {
 		writeErr(w, err)
 		return
 	}
-	dsn, err := req.dsn()
+	cfg, err := a.loginConfig(req)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	cfg, err := pgxpool.ParseConfig(dsn)
-	if err != nil {
-		writeErr(w, fmt.Errorf("invalid connection settings: %w", err))
+	old := a.sessionFor(r)
+	if (old == nil || old.fixed) && a.sessionCount() >= a.cfg.maxSessions {
+		writeJSON(w, http.StatusServiceUnavailable, apiErr{Error: errTooManySessions.Error()})
 		return
 	}
 	s, err := a.openSession(r.Context(), cfg)
@@ -150,14 +189,18 @@ func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	if old := a.sessionFor(r); old != nil && !old.fixed {
+	if old != nil && !old.fixed {
 		a.dropSession(w, old)
 	}
-	a.addSession(w, r, s)
+	if err := a.addSession(w, r, s); err != nil {
+		go s.close()
+		writeJSON(w, http.StatusServiceUnavailable, apiErr{Error: err.Error()})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-func (a *App) handleLogout(s *Session, w http.ResponseWriter, r *http.Request) (any, error) {
+func (a *App) handleLogout(s *Session, db *DB, w http.ResponseWriter, r *http.Request) (any, error) {
 	if s.fixed {
 		return nil, errors.New("this server is started with a fixed -dsn; there is nothing to sign out of")
 	}
@@ -165,14 +208,14 @@ func (a *App) handleLogout(s *Session, w http.ResponseWriter, r *http.Request) (
 	return map[string]any{"ok": true}, nil
 }
 
-func (a *App) handleMeta(s *Session, w http.ResponseWriter, r *http.Request) (any, error) {
+func (a *App) handleMeta(s *Session, db *DB, w http.ResponseWriter, r *http.Request) (any, error) {
 	ctx := r.Context()
-	pool := s.Pool()
+	pool := db.pool
 	out := map[string]any{"fixed": s.fixed, "readonly": a.cfg.readonly, "version": version}
-	var user, db, server, host string
+	var user, dbName, server, host string
 	var ro string
 	err := pool.QueryRow(ctx, `SELECT current_user, current_database(), current_setting('server_version'),
-		COALESCE(inet_server_addr()::text, ''), current_setting('default_transaction_read_only')`).Scan(&user, &db, &server, &host, &ro)
+		COALESCE(inet_server_addr()::text, ''), current_setting('default_transaction_read_only')`).Scan(&user, &dbName, &server, &host, &ro)
 	if err != nil {
 		return nil, err
 	}
@@ -180,7 +223,7 @@ func (a *App) handleMeta(s *Session, w http.ResponseWriter, r *http.Request) (an
 	if cc.Host != "" {
 		host = cc.Host
 	}
-	out["user"], out["database"], out["server"], out["host"], out["port"] = user, db, server, host, cc.Port
+	out["user"], out["database"], out["server"], out["host"], out["port"] = user, dbName, server, host, cc.Port
 	out["readonly"] = a.cfg.readonly || ro == "on"
 	rows, err := pool.Query(ctx, `SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate AND has_database_privilege(datname, 'CONNECT') ORDER BY 1`)
 	if err != nil {
@@ -194,7 +237,7 @@ func (a *App) handleMeta(s *Session, w http.ResponseWriter, r *http.Request) (an
 	return out, nil
 }
 
-func (a *App) handleUse(s *Session, w http.ResponseWriter, r *http.Request) (any, error) {
+func (a *App) handleUse(s *Session, db *DB, w http.ResponseWriter, r *http.Request) (any, error) {
 	var req struct {
 		Database string `json:"database"`
 	}
@@ -204,15 +247,15 @@ func (a *App) handleUse(s *Session, w http.ResponseWriter, r *http.Request) (any
 	if req.Database == "" {
 		return nil, errors.New("database is required")
 	}
-	if err := s.connect(r.Context(), req.Database, a.cfg.readonly); err != nil {
+	if err := s.connect(r.Context(), req.Database, a.cfg); err != nil {
 		return nil, err
 	}
 	return map[string]any{"ok": true}, nil
 }
 
-func (a *App) handleTables(s *Session, w http.ResponseWriter, r *http.Request) (any, error) {
-	s.forgetMeta()
-	tables, schemas, err := listTables(r.Context(), s.Pool())
+func (a *App) handleTables(s *Session, db *DB, w http.ResponseWriter, r *http.Request) (any, error) {
+	db.forgetMeta()
+	tables, schemas, err := listTables(r.Context(), db.pool)
 	if err != nil {
 		return nil, err
 	}
@@ -227,12 +270,12 @@ type tableRef struct {
 	Name   string `json:"name"`
 }
 
-func (a *App) handleTable(s *Session, w http.ResponseWriter, r *http.Request) (any, error) {
+func (a *App) handleTable(s *Session, db *DB, w http.ResponseWriter, r *http.Request) (any, error) {
 	var req tableRef
 	if err := decode(r, &req); err != nil {
 		return nil, err
 	}
-	return s.tableMeta(r.Context(), req.Schema, req.Name, true)
+	return db.tableMeta(r.Context(), req.Schema, req.Name, true)
 }
 
 // ---------- browsing ----------
@@ -295,6 +338,17 @@ func likeEscape(s string) string {
 }
 
 func strp(s string) *string { return &s }
+
+// hasRawSQL reports whether the view carries user-written SQL, which may
+// change session state (set_config, advisory locks) on its connection.
+func (req *viewReq) hasRawSQL() bool {
+	for _, f := range req.Filters {
+		if f.Op == "sql" {
+			return true
+		}
+	}
+	return false
+}
 
 func buildWhere(m *TableMeta, req *viewReq, args *sqlArgs) (string, error) {
 	var conds []string
@@ -386,7 +440,9 @@ func buildOrder(m *TableMeta, req *viewReq) (string, error) {
 func selectList(m *TableMeta, forExport bool) string {
 	var parts []string
 	if m.KeyMode == "ctid" && !forExport {
-		parts = append(parts, `ctid::text AS "__ctid"`)
+		// ctid alone is a slot that VACUUM can hand to another row; with
+		// xmin the key names exactly this version of this row.
+		parts = append(parts, `ctid::text || ':' || xmin::text AS "__ctid"`)
 	}
 	for _, c := range m.Columns {
 		col := ident(c.Name)
@@ -402,13 +458,13 @@ func selectList(m *TableMeta, forExport bool) string {
 	return strings.Join(parts, ", ")
 }
 
-func (a *App) handleRows(s *Session, w http.ResponseWriter, r *http.Request) (any, error) {
+func (a *App) handleRows(s *Session, db *DB, w http.ResponseWriter, r *http.Request) (any, error) {
 	var req viewReq
 	if err := decode(r, &req); err != nil {
 		return nil, err
 	}
 	ctx := r.Context()
-	m, err := s.tableMeta(ctx, req.Schema, req.Name, false)
+	m, err := db.tableMeta(ctx, req.Schema, req.Name, false)
 	if err != nil {
 		return nil, err
 	}
@@ -430,19 +486,19 @@ func (a *App) handleRows(s *Session, w http.ResponseWriter, r *http.Request) (an
 	sql := "SELECT " + selectList(m, false) + " FROM " + ident(m.Schema, m.Name) + " AS " + rowAlias +
 		where + order + fmt.Sprintf(" LIMIT %d OFFSET %d", req.Limit, req.Offset)
 	start := time.Now()
-	res, err := s.execText(ctx, sql, args.vals)
+	res, err := db.execText(ctx, sql, args.vals, req.hasRawSQL())
 	if err != nil {
 		return nil, err
 	}
 	return map[string]any{"rows": res.rows, "ms": time.Since(start).Milliseconds()}, nil
 }
 
-func (a *App) handleCount(s *Session, w http.ResponseWriter, r *http.Request) (any, error) {
+func (a *App) handleCount(s *Session, db *DB, w http.ResponseWriter, r *http.Request) (any, error) {
 	var req viewReq
 	if err := decode(r, &req); err != nil {
 		return nil, err
 	}
-	m, err := s.tableMeta(r.Context(), req.Schema, req.Name, false)
+	m, err := db.tableMeta(r.Context(), req.Schema, req.Name, false)
 	if err != nil {
 		return nil, err
 	}
@@ -456,7 +512,7 @@ func (a *App) handleCount(s *Session, w http.ResponseWriter, r *http.Request) (a
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), countTimeout)
 	defer cancel()
-	res, err := s.execText(ctx, "SELECT count(*) FROM "+ident(m.Schema, m.Name)+" AS "+rowAlias+where, args.vals)
+	res, err := db.execText(ctx, "SELECT count(*) FROM "+ident(m.Schema, m.Name)+" AS "+rowAlias+where, args.vals, req.hasRawSQL())
 	if err != nil {
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			return map[string]any{"count": max(m.Estimate, 0), "exact": false}, nil
@@ -488,7 +544,11 @@ func keyWhere(m *TableMeta, key rowKey, args *sqlArgs) (string, error) {
 		if v == nil {
 			return "", errors.New("missing row id")
 		}
-		return "ctid = " + args.add(v) + "::tid", nil
+		tid, xmin, ok := strings.Cut(*v, ":")
+		if !ok || tid == "" || xmin == "" {
+			return "", errors.New("this row id is out of date; refresh and try again")
+		}
+		return "ctid = " + args.add(&tid) + "::tid AND xmin = " + args.add(&xmin) + "::xid", nil
 	}
 	return "", errors.New("this relation is read-only here: it has no primary key")
 }
@@ -500,11 +560,11 @@ type editReq struct {
 	Values map[string]*string `json:"values"`
 }
 
-func (a *App) editable(s *Session, ctx context.Context, ref tableRef) (*TableMeta, error) {
+func (a *App) editable(db *DB, ctx context.Context, ref tableRef) (*TableMeta, error) {
 	if a.cfg.readonly {
 		return nil, errors.New("airadminer is running in read-only mode")
 	}
-	return s.tableMeta(ctx, ref.Schema, ref.Name, false)
+	return db.tableMeta(ctx, ref.Schema, ref.Name, false)
 }
 
 // stmt is one parameterised write that must touch exactly one row.
@@ -555,13 +615,13 @@ func insertSQL(m *TableMeta, values map[string]*string) (stmt, error) {
 	return stmt{sql + " RETURNING " + selectList(m, false), args.vals}, nil
 }
 
-func (a *App) handleUpdate(s *Session, w http.ResponseWriter, r *http.Request) (any, error) {
+func (a *App) handleUpdate(s *Session, db *DB, w http.ResponseWriter, r *http.Request) (any, error) {
 	var req editReq
 	if err := decode(r, &req); err != nil {
 		return nil, err
 	}
 	ctx := r.Context()
-	m, err := a.editable(s, ctx, req.tableRef)
+	m, err := a.editable(db, ctx, req.tableRef)
 	if err != nil {
 		return nil, err
 	}
@@ -569,16 +629,16 @@ func (a *App) handleUpdate(s *Session, w http.ResponseWriter, r *http.Request) (
 	if err != nil {
 		return nil, err
 	}
-	return s.writeOne(ctx, st.sql, st.args)
+	return db.writeOne(ctx, st.sql, st.args)
 }
 
-func (a *App) handleInsert(s *Session, w http.ResponseWriter, r *http.Request) (any, error) {
+func (a *App) handleInsert(s *Session, db *DB, w http.ResponseWriter, r *http.Request) (any, error) {
 	var req editReq
 	if err := decode(r, &req); err != nil {
 		return nil, err
 	}
 	ctx := r.Context()
-	m, err := a.editable(s, ctx, req.tableRef)
+	m, err := a.editable(db, ctx, req.tableRef)
 	if err != nil {
 		return nil, err
 	}
@@ -586,7 +646,7 @@ func (a *App) handleInsert(s *Session, w http.ResponseWriter, r *http.Request) (
 	if err != nil {
 		return nil, err
 	}
-	return s.writeOne(ctx, st.sql, st.args)
+	return db.writeOne(ctx, st.sql, st.args)
 }
 
 type batchReq struct {
@@ -604,13 +664,13 @@ const maxBatch = 2000
 // handleBatch applies many row updates, inserts and deletes in one
 // transaction, so a paste, a multi-cell clear or an undo either lands
 // completely or not at all.
-func (a *App) handleBatch(s *Session, w http.ResponseWriter, r *http.Request) (any, error) {
+func (a *App) handleBatch(s *Session, db *DB, w http.ResponseWriter, r *http.Request) (any, error) {
 	var req batchReq
 	if err := decode(r, &req); err != nil {
 		return nil, err
 	}
 	ctx := r.Context()
-	m, err := a.editable(s, ctx, req.tableRef)
+	m, err := a.editable(db, ctx, req.tableRef)
 	if err != nil {
 		return nil, err
 	}
@@ -644,7 +704,7 @@ func (a *App) handleBatch(s *Session, w http.ResponseWriter, r *http.Request) (a
 		}
 		stmts = append(stmts, stmt{"DELETE FROM " + ident(m.Schema, m.Name) + " WHERE " + where + " RETURNING " + selectList(m, false), args.vals})
 	}
-	rows, err := s.writeMany(ctx, stmts)
+	rows, err := db.writeMany(ctx, stmts)
 	if err != nil {
 		return nil, err
 	}
@@ -654,18 +714,18 @@ func (a *App) handleBatch(s *Session, w http.ResponseWriter, r *http.Request) (a
 
 // writeMany runs each statement in one transaction. Each must touch exactly
 // one row; otherwise everything is rolled back.
-func (s *Session) writeMany(ctx context.Context, stmts []stmt) ([][]any, error) {
-	conn, err := s.Pool().Acquire(ctx)
+func (db *DB) writeMany(ctx context.Context, stmts []stmt) ([][]any, error) {
+	conn, err := db.pool.Acquire(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Release()
+	defer release(conn, false)
 	pc := conn.Conn().PgConn()
 	if _, err := pc.Exec(ctx, "BEGIN").ReadAll(); err != nil {
 		return nil, err
 	}
 	rollback := func(err error) ([][]any, error) {
-		_, _ = pc.Exec(context.Background(), "ROLLBACK").ReadAll()
+		rollbackOrClose(conn)
 		return nil, err
 	}
 	rows := make([][]any, 0, len(stmts))
@@ -701,32 +761,32 @@ type batchErr struct {
 func (e *batchErr) Error() string { return e.err.Error() }
 func (e *batchErr) Unwrap() error { return e.err }
 
-func (s *Session) writeOne(ctx context.Context, sql string, params [][]byte) (any, error) {
-	rows, err := s.writeMany(ctx, []stmt{{sql, params}})
+func (db *DB) writeOne(ctx context.Context, sql string, params [][]byte) (any, error) {
+	rows, err := db.writeMany(ctx, []stmt{{sql, params}})
 	if err != nil {
 		return nil, err
 	}
 	return map[string]any{"row": rows[0]}, nil
 }
 
-func (a *App) handleDelete(s *Session, w http.ResponseWriter, r *http.Request) (any, error) {
+func (a *App) handleDelete(s *Session, db *DB, w http.ResponseWriter, r *http.Request) (any, error) {
 	var req editReq
 	if err := decode(r, &req); err != nil {
 		return nil, err
 	}
 	ctx := r.Context()
-	m, err := a.editable(s, ctx, req.tableRef)
+	m, err := a.editable(db, ctx, req.tableRef)
 	if err != nil {
 		return nil, err
 	}
 	if len(req.Keys) == 0 {
 		return nil, errors.New("no rows selected")
 	}
-	conn, err := s.Pool().Acquire(ctx)
+	conn, err := db.pool.Acquire(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Release()
+	defer release(conn, false)
 	pc := conn.Conn().PgConn()
 	if _, err := pc.Exec(ctx, "BEGIN").ReadAll(); err != nil {
 		return nil, err
@@ -741,7 +801,7 @@ func (a *App) handleDelete(s *Session, w http.ResponseWriter, r *http.Request) (
 			total += res.CommandTag.RowsAffected()
 		}
 		if err != nil {
-			_, _ = pc.Exec(context.Background(), "ROLLBACK").ReadAll()
+			rollbackOrClose(conn)
 			return nil, err
 		}
 	}
@@ -791,13 +851,13 @@ func duplicateSQL(m *TableMeta, where string, overrides map[string]*string, args
 
 const maxDuplicate = 1000
 
-func (a *App) handleDuplicate(s *Session, w http.ResponseWriter, r *http.Request) (any, error) {
+func (a *App) handleDuplicate(s *Session, db *DB, w http.ResponseWriter, r *http.Request) (any, error) {
 	var req editReq
 	if err := decode(r, &req); err != nil {
 		return nil, err
 	}
 	ctx := r.Context()
-	m, err := a.editable(s, ctx, req.tableRef)
+	m, err := a.editable(db, ctx, req.tableRef)
 	if err != nil {
 		return nil, err
 	}
@@ -823,7 +883,7 @@ func (a *App) handleDuplicate(s *Session, w http.ResponseWriter, r *http.Request
 		}
 		stmts = append(stmts, stmt{sql, args.vals})
 	}
-	rows, err := s.writeMany(ctx, stmts)
+	rows, err := db.writeMany(ctx, stmts)
 	if err != nil {
 		return nil, err
 	}
@@ -845,7 +905,7 @@ type queryResult struct {
 	Truncated bool       `json:"truncated"`
 }
 
-func (a *App) handleQuery(s *Session, w http.ResponseWriter, r *http.Request) (any, error) {
+func (a *App) handleQuery(s *Session, db *DB, w http.ResponseWriter, r *http.Request) (any, error) {
 	var req struct {
 		SQL string `json:"sql"`
 	}
@@ -856,11 +916,11 @@ func (a *App) handleQuery(s *Session, w http.ResponseWriter, r *http.Request) (a
 		return nil, errors.New("write a query first")
 	}
 	ctx := r.Context()
-	conn, err := s.Pool().Acquire(ctx)
+	conn, err := db.pool.Acquire(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Release()
+	defer release(conn, true) // SET, SET ROLE, temp tables... must not leak into later requests
 	pc := conn.Conn().PgConn()
 	start := time.Now()
 	results := []queryResult{}
@@ -887,13 +947,8 @@ func (a *App) handleQuery(s *Session, w http.ResponseWriter, r *http.Request) (a
 	}
 	execErr := mrr.Close()
 	ms := time.Since(start).Milliseconds()
-	// A failed statement inside an explicit transaction leaves the pooled
-	// connection aborted; reset it so the next query starts clean.
-	if pc.TxStatus() != 'I' {
-		_, _ = pc.Exec(context.Background(), "ROLLBACK").ReadAll()
-	}
 	if len(results) > 0 {
-		s.fillTypeNames(ctx, conn, results)
+		db.fillTypeNames(ctx, conn, results)
 	}
 	out := map[string]any{"results": results, "ms": ms}
 	if execErr != nil {
@@ -907,14 +962,14 @@ func (a *App) handleQuery(s *Session, w http.ResponseWriter, r *http.Request) (a
 		}
 		out["error"] = e
 	}
-	if s.mayChangeSchema(req.SQL) {
-		s.forgetMeta()
+	if mayChangeSchema(req.SQL) {
+		db.forgetMeta()
 		out["schemaChanged"] = true
 	}
 	return out, nil
 }
 
-func (s *Session) mayChangeSchema(sql string) bool {
+func mayChangeSchema(sql string) bool {
 	u := strings.ToUpper(sql)
 	for _, kw := range []string{"CREATE", "ALTER", "DROP", "RENAME", "COMMENT", "TRUNCATE"} {
 		if strings.Contains(u, kw) {
@@ -924,17 +979,17 @@ func (s *Session) mayChangeSchema(sql string) bool {
 	return false
 }
 
-func (s *Session) fillTypeNames(ctx context.Context, conn *pgxpool.Conn, results []queryResult) {
-	s.metaMu.Lock()
+func (db *DB) fillTypeNames(ctx context.Context, conn *pgxpool.Conn, results []queryResult) {
+	db.metaMu.Lock()
 	var missing []int64
 	for _, r := range results {
 		for _, c := range r.Columns {
-			if _, ok := s.typeNames[c.OID]; !ok {
+			if _, ok := db.typeNames[c.OID]; !ok {
 				missing = append(missing, int64(c.OID))
 			}
 		}
 	}
-	s.metaMu.Unlock()
+	db.metaMu.Unlock()
 	if len(missing) > 0 {
 		rows, err := conn.Query(ctx, `SELECT oid::int8, format_type(oid, NULL) FROM pg_type WHERE oid::int8 = ANY($1)`, missing)
 		if err == nil {
@@ -942,32 +997,32 @@ func (s *Session) fillTypeNames(ctx context.Context, conn *pgxpool.Conn, results
 				var oid int64
 				var name string
 				if rows.Scan(&oid, &name) == nil {
-					s.metaMu.Lock()
-					s.typeNames[uint32(oid)] = name
-					s.metaMu.Unlock()
+					db.metaMu.Lock()
+					db.typeNames[uint32(oid)] = name
+					db.metaMu.Unlock()
 				}
 			}
 			rows.Close()
 		}
 	}
-	s.metaMu.Lock()
-	defer s.metaMu.Unlock()
+	db.metaMu.Lock()
+	defer db.metaMu.Unlock()
 	for i := range results {
 		for j := range results[i].Columns {
-			results[i].Columns[j].Type = s.typeNames[results[i].Columns[j].OID]
+			results[i].Columns[j].Type = db.typeNames[results[i].Columns[j].OID]
 		}
 	}
 }
 
 // ---------- export ----------
 
-func (a *App) handleExport(s *Session, w http.ResponseWriter, r *http.Request) (any, error) {
+func (a *App) handleExport(s *Session, db *DB, w http.ResponseWriter, r *http.Request) (any, error) {
 	var req viewReq
 	if err := decode(r, &req); err != nil {
 		return nil, err
 	}
 	ctx := r.Context()
-	m, err := s.tableMeta(ctx, req.Schema, req.Name, false)
+	m, err := db.tableMeta(ctx, req.Schema, req.Name, false)
 	if err != nil {
 		return nil, err
 	}
@@ -981,11 +1036,11 @@ func (a *App) handleExport(s *Session, w http.ResponseWriter, r *http.Request) (
 		return nil, err
 	}
 	sql := "COPY (SELECT " + selectList(m, true) + " FROM " + ident(m.Schema, m.Name) + " AS " + rowAlias + where + order + ") TO STDOUT WITH (FORMAT csv, HEADER)"
-	conn, err := s.Pool().Acquire(ctx)
+	conn, err := db.pool.Acquire(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Release()
+	defer release(conn, req.hasRawSQL())
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", m.Name+".csv"))
 	bw := &lazyWriter{w: w}
@@ -1019,6 +1074,51 @@ func (l *lazyWriter) Write(p []byte) (int, error) {
 
 // ---------- low level ----------
 
+const cleanupTimeout = 5 * time.Second
+
+// rollbackOrClose ends a failed transaction. If even that fails (broken or
+// stuck connection), the connection is closed instead of going back to the
+// pool in an unknown state.
+func rollbackOrClose(conn *pgxpool.Conn) {
+	pc := conn.Conn().PgConn()
+	if pc.IsClosed() || pc.TxStatus() == 'I' {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+	defer cancel()
+	if _, err := pc.Exec(ctx, "ROLLBACK").ReadAll(); err != nil {
+		_ = pc.Close(ctx)
+	}
+}
+
+// release returns a connection to the pool. A connection that ran SQL the
+// user wrote is reset first: DISCARD ALL undoes SET, SET ROLE, session
+// authorization, temp tables, advisory locks, LISTEN and prepared
+// statements, back to the settings the connection started with. If the
+// reset fails the connection is closed rather than reused.
+func release(conn *pgxpool.Conn, userSQL bool) {
+	defer conn.Release()
+	pc := conn.Conn().PgConn()
+	if pc.IsClosed() {
+		return
+	}
+	if pc.TxStatus() != 'I' {
+		rollbackOrClose(conn)
+	}
+	if !userSQL || pc.IsClosed() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+	defer cancel()
+	if _, err := pc.Exec(ctx, "DISCARD ALL").ReadAll(); err != nil {
+		_ = pc.Close(ctx)
+		return
+	}
+	if err := conn.Conn().DeallocateAll(ctx); err != nil {
+		_ = pc.Close(ctx)
+	}
+}
+
 type textResult struct {
 	rows [][]any
 }
@@ -1038,12 +1138,12 @@ func textRow(vals [][]byte) []any {
 
 // execText runs one parameterised statement and returns every value in
 // PostgreSQL's own text format, so the browser sees exactly what psql would.
-func (s *Session) execText(ctx context.Context, sql string, params [][]byte) (*textResult, error) {
-	conn, err := s.Pool().Acquire(ctx)
+func (db *DB) execText(ctx context.Context, sql string, params [][]byte, userSQL bool) (*textResult, error) {
+	conn, err := db.pool.Acquire(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Release()
+	defer release(conn, userSQL)
 	res := conn.Conn().PgConn().ExecParams(ctx, sql, params, nil, nil, nil).Read()
 	if res.Err != nil {
 		return nil, res.Err

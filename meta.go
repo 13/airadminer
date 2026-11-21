@@ -120,23 +120,23 @@ type querier interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
-func (s *Session) tableMeta(ctx context.Context, schema, name string, fresh bool) (*TableMeta, error) {
+func (db *DB) tableMeta(ctx context.Context, schema, name string, fresh bool) (*TableMeta, error) {
 	key := schema + "\x00" + name
 	if !fresh {
-		s.metaMu.Lock()
-		m := s.metaCache[key]
-		s.metaMu.Unlock()
+		db.metaMu.Lock()
+		m := db.metaCache[key]
+		db.metaMu.Unlock()
 		if m != nil {
 			return m, nil
 		}
 	}
-	m, err := loadMeta(ctx, s.Pool(), schema, name)
+	m, err := loadMeta(ctx, db.pool, schema, name)
 	if err != nil {
 		return nil, err
 	}
-	s.metaMu.Lock()
-	s.metaCache[key] = m
-	s.metaMu.Unlock()
+	db.metaMu.Lock()
+	db.metaCache[key] = m
+	db.metaMu.Unlock()
 	return m, nil
 }
 
