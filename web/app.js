@@ -1668,9 +1668,10 @@ class TableView {
 
   renderFrame() {
     const m = this.meta;
-    const kindName = { r: "", v: "View", m: "Materialized view", f: "Foreign table", p: "Partitioned" }[m.kind];
+    const kindName = m.hypertable ? "Hypertable" : { r: "", v: "View", m: "Materialized view", f: "Foreign table", p: "Partitioned" }[m.kind];
     let badge = "";
     if (S.meta.readonly) badge = `<span class="badge warn">Read-only session</span>`;
+    else if (!m.keyMode && m.hypertable) badge = `<span class="badge" title="A compressed hypertable can be edited only with a primary key">Read-only: no primary key</span>`;
     else if (!m.keyMode) badge = `<span class="badge" title="Rows can be edited only in tables with a primary key">${kindName && m.kind !== "p" ? "Read-only " + kindName.toLowerCase() : "Read-only: no primary key"}</span>`;
     else if (kindName) badge = `<span class="badge">${kindName}</span>`;
     const base = `#/t/${encodeURIComponent(m.schema)}/${encodeURIComponent(m.name)}`;

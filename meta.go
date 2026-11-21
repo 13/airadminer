@@ -52,16 +52,22 @@ type Constraint struct {
 }
 
 type TableMeta struct {
-	Schema      string       `json:"schema"`
-	Name        string       `json:"name"`
-	Kind        string       `json:"kind"`
-	OID         uint32       `json:"oid"`
-	Estimate    int64        `json:"estimate"`
-	Size        *int64       `json:"size"`
-	Comment     *string      `json:"comment"`
-	Columns     []Column     `json:"columns"`
-	PK          []string     `json:"pk"`
-	KeyMode     string       `json:"keyMode"` // "pk", "ctid" or "" (read-only)
+	Schema   string   `json:"schema"`
+	Name     string   `json:"name"`
+	Kind     string   `json:"kind"`
+	OID      uint32   `json:"oid"`
+	Estimate int64    `json:"estimate"`
+	Size     *int64   `json:"size"`
+	Comment  *string  `json:"comment"`
+	Columns  []Column `json:"columns"`
+	PK       []string `json:"pk"`
+	KeyMode  string   `json:"keyMode"` // "pk", "ctid" or "" (read-only)
+	// Inherited is set when other tables inherit from this one, such as
+	// the chunks of a TimescaleDB hypertable. A scan of the parent then
+	// returns their rows too, and ctid (and even ctid with xmin) can repeat
+	// across them, so ctid keys also carry the tableoid.
+	Inherited   bool         `json:"-"`
+	Hypertable  bool         `json:"hypertable,omitempty"`
 	Indexes     []Index      `json:"indexes"`
 	Constraints []Constraint `json:"constraints"`
 	Incoming    []Incoming   `json:"incoming"`
@@ -84,13 +90,65 @@ type TableInfo struct {
 	Estimate int64   `json:"estimate"`
 	Size     *int64  `json:"size"`
 	Comment  *string `json:"comment"`
+	// Hypertable marks a TimescaleDB hypertable.
+	Hypertable bool `json:"hypertable,omitempty"`
 }
 
-const userSchemas = `n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg\_toast%' AND n.nspname NOT LIKE 'pg\_temp\_%'`
+// userSchemas leaves out the system schemas, and TimescaleDB's: its
+// internal schemas hold one table per chunk, thousands in a large database.
+const userSchemas = `n.nspname NOT IN ('pg_catalog','information_schema','timescaledb_information','timescaledb_experimental') AND n.nspname NOT LIKE 'pg\_toast%' AND n.nspname NOT LIKE 'pg\_temp\_%' AND n.nspname NOT LIKE '\_timescaledb\_%'`
+
+// hyperInfo describes a TimescaleDB hypertable. Its rows live in chunk
+// tables (and compressed chunks in tables of their own), so pg_class has
+// the figures of an empty table for the hypertable itself.
+type hyperInfo struct {
+	size, rows int64
+	compressed bool
+}
+
+// hypertables returns the hypertables of the database by oid, or of only
+// the given one when oid is not 0. It returns nil without TimescaleDB, and
+// also when the lookup fails: the figures are a nicety, not a requirement.
+func hypertables(ctx context.Context, q querier, oid uint32) map[uint32]hyperInfo {
+	var has bool
+	if err := q.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_extension WHERE extname = 'timescaledb')`).Scan(&has); err != nil || !has {
+		return nil
+	}
+	rows, err := q.Query(ctx, `
+		SELECT c.oid, hypertable_size(c.oid), approximate_row_count(c.oid), h.compression_enabled
+		FROM timescaledb_information.hypertables h
+		JOIN pg_namespace n ON n.nspname = h.hypertable_schema
+		JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = h.hypertable_name
+		WHERE $1::oid = 0 OR c.oid = $1::oid`, oid)
+	if err != nil {
+		return nil
+	}
+	out := map[uint32]hyperInfo{}
+	for rows.Next() {
+		var o uint32
+		var size, n *int64
+		var h hyperInfo
+		if rows.Scan(&o, &size, &n, &h.compressed) != nil {
+			rows.Close()
+			return nil
+		}
+		if size != nil {
+			h.size = *size
+		}
+		if n != nil {
+			h.rows = *n
+		}
+		out[o] = h
+	}
+	if rows.Err() != nil {
+		return nil
+	}
+	return out
+}
 
 func listTables(ctx context.Context, q querier) ([]TableInfo, []string, error) {
 	rows, err := q.Query(ctx, `
-		SELECT n.nspname, c.relname, c.relkind::text, c.reltuples::bigint,
+		SELECT c.oid, n.nspname, c.relname, c.relkind::text, c.reltuples::bigint,
 		       CASE WHEN c.relkind IN ('r','m','p') THEN pg_total_relation_size(c.oid) END,
 		       obj_description(c.oid, 'pg_class')
 		FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -99,13 +157,24 @@ func listTables(ctx context.Context, q querier) ([]TableInfo, []string, error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	var oids []uint32
 	tables, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (TableInfo, error) {
 		var t TableInfo
-		err := r.Scan(&t.Schema, &t.Name, &t.Kind, &t.Estimate, &t.Size, &t.Comment)
+		var oid uint32
+		err := r.Scan(&oid, &t.Schema, &t.Name, &t.Kind, &t.Estimate, &t.Size, &t.Comment)
+		oids = append(oids, oid)
 		return t, err
 	})
 	if err != nil {
 		return nil, nil, err
+	}
+	if hts := hypertables(ctx, q, 0); hts != nil {
+		for i, oid := range oids {
+			if h, ok := hts[oid]; ok {
+				size := h.size
+				tables[i].Size, tables[i].Estimate, tables[i].Hypertable = &size, h.rows, true
+			}
+		}
 	}
 	rows, err = q.Query(ctx, `SELECT n.nspname FROM pg_namespace n WHERE `+userSchemas+` ORDER BY n.nspname = 'public' DESC, 1`)
 	if err != nil {
@@ -146,10 +215,11 @@ func loadMeta(ctx context.Context, q querier, schema, name string) (*TableMeta, 
 		SELECT c.oid, c.relkind::text, c.reltuples::bigint,
 		       CASE WHEN c.relkind IN ('r','m','p') THEN pg_total_relation_size(c.oid) END,
 		       obj_description(c.oid, 'pg_class'),
-		       CASE WHEN c.relkind IN ('v','m') THEN pg_get_viewdef(c.oid, true) END
+		       CASE WHEN c.relkind IN ('v','m') THEN pg_get_viewdef(c.oid, true) END,
+		       c.relhassubclass
 		FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
 		WHERE n.nspname = $1 AND c.relname = $2`, schema, name).
-		Scan(&m.OID, &m.Kind, &m.Estimate, &m.Size, &m.Comment, &m.ViewDef)
+		Scan(&m.OID, &m.Kind, &m.Estimate, &m.Size, &m.Comment, &m.ViewDef, &m.Inherited)
 	if err == pgx.ErrNoRows {
 		return nil, fmt.Errorf("table %s.%s does not exist", schema, name)
 	}
@@ -199,10 +269,20 @@ func loadMeta(ctx context.Context, q querier, schema, name string) (*TableMeta, 
 			c.PK = true
 		}
 	}
+	compressed := false
+	if m.Kind == "r" && m.Inherited {
+		if h, ok := hypertables(ctx, q, m.OID)[m.OID]; ok {
+			size := h.size
+			m.Size, m.Estimate, m.Hypertable, compressed = &size, h.rows, true, h.compressed
+		}
+	}
 	switch {
 	case len(m.PK) > 0 && (m.Kind == "r" || m.Kind == "p"):
 		m.KeyMode = "pk"
-	case m.Kind == "r":
+	case m.Kind == "r" && !compressed:
+		// A hypertable with compression cannot be read with ctid or xmin
+		// ("transparent decompression only supports tableoid system
+		// column"), so without a primary key it stays read-only.
 		m.KeyMode = "ctid"
 	}
 

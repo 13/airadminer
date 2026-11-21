@@ -133,7 +133,9 @@ Without `-dsn`, you see a login screen like Adminer's. Credentials are held in t
 
 ## How editing works
 
-Rows are identified by their primary key. Tables without one fall back to `ctid` together with `xmin`. That pair names one version of one row, so if the row changed, or was deleted and its slot reused by `VACUUM`, the edit is refused instead of landing on another row. Reload the rows and try again. Views without a primary key are read-only.
+Rows are identified by their primary key. Tables without one fall back to `ctid` together with `xmin`. That pair names one version of one row, so if the row changed, or was deleted and its slot reused by `VACUUM`, the edit is refused instead of landing on another row. Reload the rows and try again. Views without a primary key are read-only. In a table that other tables inherit from, such as a TimescaleDB hypertable, the same `ctid` and `xmin` can appear in every child, so the key also carries the row's `tableoid`.
+
+TimescaleDB: hypertables show their real size and row estimate, and the internal `_timescaledb_*` and `timescaledb_information` schemas, with one table per chunk, are hidden from the sidebar (the SQL editor can still query them). A hypertable with compression enabled cannot be read with `ctid` or `xmin`, so without a primary key it is read-only. Give it one that includes the time column, such as `PRIMARY KEY (id, time)`, to edit it.
 
 Values travel as PostgreSQL's own text format in both directions, the same text `psql` shows. Each edit is one `UPDATE … WHERE <key> RETURNING …`. A paste, clear or undo sends all its changes in one transaction. It is rejected if the row no longer matches exactly one record.
 

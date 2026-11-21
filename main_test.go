@@ -455,8 +455,31 @@ func TestEscapeFormula(t *testing.T) {
 	}
 }
 
+func TestKeyWhereInheritedCtid(t *testing.T) {
+	m := &TableMeta{Schema: "s", Name: "t", KeyMode: "ctid", Inherited: true}
+	k := "16384:(0,1):1234"
+	args := &sqlArgs{}
+	w, err := keyWhere(m, rowKey{"__ctid": &k}, args)
+	if err != nil || w != "tableoid = $1::oid AND ctid = $2::tid AND xmin = $3::xid" || string(args.vals[0]) != "16384" || string(args.vals[1]) != "(0,1)" {
+		t.Fatalf("keyWhere = %q %q %v", w, args.vals, err)
+	}
+	// Without the tableoid the key could name a row in every child.
+	for _, old := range []string{"(0,1):1234", ":(0,1):1234", "16384:(0,1)"} {
+		if _, err := keyWhere(m, rowKey{"__ctid": &old}, &sqlArgs{}); err == nil {
+			t.Fatalf("%q must be refused", old)
+		}
+	}
+	m.Inherited = false
+	if _, err := keyWhere(m, rowKey{"__ctid": &k}, &sqlArgs{}); err == nil {
+		t.Fatal("a key with a tableoid must be refused for a table without children")
+	}
+}
+
 func TestOuterOrder(t *testing.T) {
 	for in, want := range map[string]string{
+		" ORDER BY tableoid DESC, ctid DESC": ` ORDER BY "__aa_tableoid" DESC, "__aa_ctid" DESC`,
+		` ORDER BY "a", tableoid, ctid`:      ` ORDER BY "a", "__aa_tableoid", "__aa_ctid"`,
+		` ORDER BY "tableoid"`:               ` ORDER BY "tableoid"`,
 		" ORDER BY ctid":                     ` ORDER BY "__aa_ctid"`,
 		" ORDER BY ctid DESC":                ` ORDER BY "__aa_ctid" DESC`,
 		` ORDER BY "a" ASC, ctid`:            ` ORDER BY "a" ASC, "__aa_ctid"`,

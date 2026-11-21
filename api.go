@@ -404,7 +404,13 @@ func keyset(m *TableMeta, req *viewReq, args *sqlArgs) (cond, order string, reve
 		if v == nil {
 			return "", "", false, false, errors.New("missing row id")
 		}
-		tid, _, _ := strings.Cut(*v, ":")
+		rel, tid, _, err := splitRowID(m, *v)
+		if err != nil {
+			return "", "", false, false, err
+		}
+		if m.Inherited {
+			return "(tableoid, ctid)" + op + "(" + args.add(&rel) + "::oid, " + args.add(&tid) + "::tid)", " ORDER BY tableoid" + dir + ", ctid" + dir, reverse, true, nil
+		}
 		return "ctid" + op + args.add(&tid) + "::tid", " ORDER BY ctid" + dir, reverse, true, nil
 	}
 	return "", "", false, false, nil
@@ -522,19 +528,26 @@ func buildWhere(m *TableMeta, req *viewReq, args *sqlArgs) (string, error) {
 }
 
 // outerOrder rewrites an ORDER BY for the page subquery, where the system
-// column ctid is available as "__aa_ctid". Quoted identifiers are skipped.
+// columns ctid and tableoid are available as "__aa_ctid" and
+// "__aa_tableoid". Quoted identifiers are skipped.
 func outerOrder(order string) string {
 	var b strings.Builder
 	quoted := false
+next:
 	for i := 0; i < len(order); i++ {
 		c := order[i]
 		if c == '"' {
 			quoted = !quoted
 		}
-		if !quoted && strings.HasPrefix(order[i:], "ctid") && (i == 0 || order[i-1] == ' ') && (i+4 == len(order) || order[i+4] == ' ' || order[i+4] == ',') {
-			b.WriteString(`"__aa_ctid"`)
-			i += 3
-			continue
+		if !quoted && (i == 0 || order[i-1] == ' ') {
+			for _, sys := range []string{"ctid", "tableoid"} {
+				n := len(sys)
+				if strings.HasPrefix(order[i:], sys) && (i+n == len(order) || order[i+n] == ' ' || order[i+n] == ',') {
+					b.WriteString(`"__aa_` + sys + `"`)
+					i += n - 1
+					continue next
+				}
+			}
 		}
 		b.WriteByte(c)
 	}
@@ -565,6 +578,9 @@ func buildOrder(m *TableMeta, req *viewReq) (string, error) {
 			}
 		}
 	case "ctid":
+		if m.Inherited {
+			parts = append(parts, "tableoid")
+		}
 		parts = append(parts, "ctid")
 	}
 	if len(parts) == 0 {
@@ -578,17 +594,24 @@ func buildOrder(m *TableMeta, req *viewReq) (string, error) {
 // and long values are cut (see cells.go): the md5 of each cut column's
 // full text follows the visible columns, for finishRow to fold in.
 func selectList(m *TableMeta, forExport bool) string {
-	return selectListWith(m, forExport, "ctid", "xmin")
+	return selectListWith(m, forExport, "tableoid", "ctid", "xmin")
 }
 
-// selectListWith reads the row id from the given ctid and xmin columns:
-// the system columns, or their copies when selecting from a subquery.
-func selectListWith(m *TableMeta, forExport bool, ctid, xmin string) string {
+// selectListWith reads the row id from the given tableoid, ctid and xmin
+// columns: the system columns, or their copies when selecting from a
+// subquery.
+func selectListWith(m *TableMeta, forExport bool, tableoid, ctid, xmin string) string {
 	var parts, hashes []string
 	if m.KeyMode == "ctid" && !forExport {
 		// ctid alone is a slot that VACUUM can hand to another row; with
-		// xmin the key names exactly this version of this row.
-		parts = append(parts, ctid+`::text || ':' || `+xmin+`::text AS "__ctid"`)
+		// xmin the key names exactly this version of this row. In a table
+		// with children the same ctid and xmin can turn up in each child,
+		// so the key then starts with the tableoid of the row's table.
+		id := ctid + `::text || ':' || ` + xmin + `::text`
+		if m.Inherited {
+			id = tableoid + `::text || ':' || ` + id
+		}
+		parts = append(parts, id+` AS "__ctid"`)
 	}
 	cut := 0
 	if !forExport {
@@ -666,9 +689,12 @@ func (a *App) handleRows(s *Session, db *DB, w http.ResponseWriter, r *http.Requ
 	sys := ""
 	if m.KeyMode == "ctid" {
 		sys = `, ctid AS "__aa_ctid", xmin AS "__aa_xmin"`
+		if m.Inherited {
+			sys += `, tableoid AS "__aa_tableoid"`
+		}
 	}
 	inner := "SELECT " + rowAlias + ".*" + sys + " FROM " + ident(m.Schema, m.Name) + " AS " + rowAlias + where + order + page
-	sql := "SELECT " + selectListWith(m, false, `"__aa_ctid"`, `"__aa_xmin"`) + " FROM (" + inner + ") AS " + rowAlias + outerOrder(order)
+	sql := "SELECT " + selectListWith(m, false, `"__aa_tableoid"`, `"__aa_ctid"`, `"__aa_xmin"`) + " FROM (" + inner + ") AS " + rowAlias + outerOrder(order)
 	start := time.Now()
 	res, err := db.execText(ctx, sql, args.vals, req.hasRawSQL())
 	if err != nil {
@@ -736,13 +762,32 @@ func keyWhere(m *TableMeta, key rowKey, args *sqlArgs) (string, error) {
 		if v == nil {
 			return "", errors.New("missing row id")
 		}
-		tid, xmin, ok := strings.Cut(*v, ":")
-		if !ok || tid == "" || xmin == "" {
-			return "", errors.New("this row id is out of date; refresh and try again")
+		rel, tid, xmin, err := splitRowID(m, *v)
+		if err != nil {
+			return "", err
 		}
-		return "ctid = " + args.add(&tid) + "::tid AND xmin = " + args.add(&xmin) + "::xid", nil
+		w := ""
+		if m.Inherited {
+			w = "tableoid = " + args.add(&rel) + "::oid AND "
+		}
+		return w + "ctid = " + args.add(&tid) + "::tid AND xmin = " + args.add(&xmin) + "::xid", nil
 	}
 	return "", errors.New("this relation is read-only here: it has no primary key")
+}
+
+// splitRowID splits a "__ctid" key, "ctid:xmin", or "tableoid:ctid:xmin"
+// for a table with children (see selectListWith). A key of the other shape
+// was read before the table gained or lost children, and is refused: a
+// bare ctid and xmin could name a row in each child.
+func splitRowID(m *TableMeta, v string) (rel, tid, xmin string, err error) {
+	parts := strings.Split(v, ":")
+	if m.Inherited && len(parts) == 3 && parts[0] != "" {
+		rel, parts = parts[0], parts[1:]
+	}
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" || (m.Inherited && rel == "") {
+		return "", "", "", errors.New("this row id is out of date; refresh and try again")
+	}
+	return rel, parts[0], parts[1], nil
 }
 
 type editReq struct {

@@ -947,3 +947,141 @@ func TestIntegrationKeysetIsFastDeepDown(t *testing.T) {
 		t.Fatalf("keyset (%v) not much faster than OFFSET (%v)", ks, off)
 	}
 }
+
+// In a table with children (inheritance, or TimescaleDB chunks) the same
+// ctid and xmin turn up in each child: rows inserted by one transaction
+// into empty children all sit at (0,1). Keys must still name one row.
+func TestIntegrationInheritedCtidKeys(t *testing.T) {
+	db := testDB(t, `CREATE TABLE p (v text);
+		CREATE TABLE c1 () INHERITS (p);
+		CREATE TABLE c2 () INHERITS (p);
+		INSERT INTO c1 VALUES ('a');
+		INSERT INTO c2 VALUES ('b');`)
+	a := newApp(config{addr: "127.0.0.1:0"})
+	defer a.closeAll()
+	c := signIn(t, a, db)
+	ref := map[string]any{"schema": "public", "name": "p"}
+	inheritedKeysWork(t, c, ref, 2)
+}
+
+// inheritedKeysWork checks a ctid-keyed table with children of n rows:
+// keyset paging sees each row once, and an update changes one row only.
+func inheritedKeysWork(t *testing.T, c *client, ref map[string]any, n int) {
+	t.Helper()
+	if _, m := c.call("table", ref); m["keyMode"] != "ctid" {
+		t.Fatalf("keyMode = %v", m["keyMode"])
+	}
+	seen := map[string]bool{}
+	var first []any
+	var after any
+	for {
+		req := map[string]any{"schema": ref["schema"], "name": ref["name"], "limit": 7}
+		if after != nil {
+			req["after"] = map[string]any{"__ctid": after}
+		}
+		code, out := c.call("rows", req)
+		if code != 200 {
+			t.Fatalf("rows: %d %v", code, out)
+		}
+		rows := out["rows"].([]any)
+		if len(rows) == 0 {
+			break
+		}
+		for _, r := range rows {
+			k := r.([]any)[0].(string)
+			if seen[k] {
+				t.Fatalf("row %s seen twice", k)
+			}
+			seen[k] = true
+			if first == nil {
+				first = r.([]any)
+			}
+			after = k
+		}
+	}
+	if len(seen) != n {
+		t.Fatalf("paged through %d rows, want %d", len(seen), n)
+	}
+	code, res := c.call("update", map[string]any{"schema": ref["schema"], "name": ref["name"], "key": map[string]any{"__ctid": first[0]}, "values": map[string]any{"v": "changed"}})
+	if code != 200 {
+		t.Fatalf("update: %d %v", code, res)
+	}
+	_, out := c.call("rows", map[string]any{"schema": ref["schema"], "name": ref["name"], "limit": 1000})
+	changed := 0
+	for _, r := range out["rows"].([]any) {
+		for _, v := range r.([]any) {
+			if v == "changed" {
+				changed++
+			}
+		}
+	}
+	if changed != 1 {
+		t.Fatalf("update changed %d rows, want 1", changed)
+	}
+}
+
+// Runs only when the server has TimescaleDB, e.g. timescale/timescaledb:latest-pg17.
+func TestIntegrationTimescaleHypertable(t *testing.T) {
+	db := testDB(t, "")
+	u := testDSN(t)
+	du := *u
+	du.Path = "/" + db
+	conn, err := pgx.Connect(context.Background(), du.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	if _, err := conn.Exec(context.Background(), "CREATE EXTENSION IF NOT EXISTS timescaledb"); err != nil {
+		t.Skipf("no TimescaleDB: %v", err)
+	}
+	if _, err := conn.Exec(context.Background(), `
+		CREATE TABLE m (t timestamptz NOT NULL, v text);
+		SELECT create_hypertable('m', 't', chunk_time_interval => interval '1 day');
+		INSERT INTO m SELECT '2026-01-01'::timestamptz + i * interval '1 hour', i::text FROM generate_series(0, 71) i;
+		CREATE TABLE z (t timestamptz NOT NULL, v text);
+		SELECT create_hypertable('z', 't', chunk_time_interval => interval '1 day');
+		INSERT INTO z SELECT '2026-01-01'::timestamptz + i * interval '1 hour', i::text FROM generate_series(0, 71) i;
+		ALTER TABLE z SET (timescaledb.compress);
+		SELECT compress_chunk(c) FROM show_chunks('z') c;
+		ANALYZE;`); err != nil {
+		t.Fatal(err)
+	}
+	a := newApp(config{addr: "127.0.0.1:0"})
+	defer a.closeAll()
+	c := signIn(t, a, db)
+
+	_, out := c.call("tables", nil)
+	for _, s := range out["schemas"].([]any) {
+		if strings.Contains(s.(string), "timescaledb") {
+			t.Errorf("schema %s listed", s)
+		}
+	}
+	found := 0
+	for _, tb := range out["tables"].([]any) {
+		tb := tb.(map[string]any)
+		if strings.Contains(tb["schema"].(string), "timescaledb") {
+			t.Fatalf("internal table %s.%s listed", tb["schema"], tb["name"])
+		}
+		if tb["name"] == "m" || tb["name"] == "z" {
+			found++
+			if tb["hypertable"] != true || tb["size"].(float64) < 16384 || tb["estimate"].(float64) <= 0 {
+				t.Errorf("hypertable %s: %v", tb["name"], tb)
+			}
+		}
+	}
+	if found != 2 {
+		t.Fatalf("found %d hypertables", found)
+	}
+
+	inheritedKeysWork(t, c, map[string]any{"schema": "public", "name": "m"}, 72)
+
+	// ctid and xmin cannot be read from compressed chunks: without a
+	// primary key the hypertable is shown read-only, but it is shown.
+	ref := map[string]any{"schema": "public", "name": "z"}
+	if _, m := c.call("table", ref); m["keyMode"] != "" || m["hypertable"] != true {
+		t.Fatalf("compressed hypertable meta: keyMode %v hypertable %v", m["keyMode"], m["hypertable"])
+	}
+	if code, out := c.call("rows", map[string]any{"schema": "public", "name": "z", "limit": 100}); code != 200 || len(out["rows"].([]any)) != 72 {
+		t.Fatalf("rows of compressed hypertable: %d %v", code, out)
+	}
+}
