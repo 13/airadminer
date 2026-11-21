@@ -454,3 +454,18 @@ func TestEscapeFormula(t *testing.T) {
 		}
 	}
 }
+
+func TestOuterOrder(t *testing.T) {
+	for in, want := range map[string]string{
+		" ORDER BY ctid":                     ` ORDER BY "__aa_ctid"`,
+		" ORDER BY ctid DESC":                ` ORDER BY "__aa_ctid" DESC`,
+		` ORDER BY "a" ASC, ctid`:            ` ORDER BY "a" ASC, "__aa_ctid"`,
+		` ORDER BY "x ctid" DESC, ctid`:      ` ORDER BY "x ctid" DESC, "__aa_ctid"`,
+		` ORDER BY "say ""ctid"" ", "ctidy"`: ` ORDER BY "say ""ctid"" ", "ctidy"`,
+		"":                                   "",
+	} {
+		if got := outerOrder(in); got != want {
+			t.Errorf("%q: got %q, want %q", in, got, want)
+		}
+	}
+}

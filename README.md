@@ -137,6 +137,10 @@ A cell cut in the grid comes with the md5 of its full value. Before such a cell 
 
 Edits never silently overwrite someone else's work. Each edit also sends the values you saw in the cells you changed. If someone else has changed one of those cells since, the edit is refused and you are asked to refresh. Undo works the same way: it reverts a cell only if the cell still holds what your change wrote.
 
+In the default order (by primary key, or by `ctid`), a page next to one already loaded is fetched from that page's first or last key instead of by OFFSET. Scrolling on from any point in a table of millions of rows therefore costs the same as at the top. A jump far down with the scrollbar, or a sort of your own, still uses OFFSET. The page is cut out first, and cut values and hashes are computed only for the rows sent.
+
+If the database drops a connection (restart, failover, a killed backend), the request answers 503 so the browser can try again. Grid reads retry once on a fresh connection on their own.
+
 Writes are addressed by record, not by position on screen. An edit still lands on its record if a refresh or a new sort moved that record, and edits to one record are saved in the order you made them. A paste or clear first loads every row it covers, so rows that were not on screen are not skipped. Copying and pasting within airadminer keeps NULL apart from empty text. JSON is re-indented for editing without touching numbers, strings or key order. The cell then shows the value the database returned, so triggers and defaults are reflected right away.
 
 ## Build
@@ -149,6 +153,7 @@ make lint       # gofmt, vet, staticcheck, govulncheck
 make test-integration  # tests against PostgreSQL (needs `make demo` running)
 make e2e        # browser tests of the grid in headless Chrome (needs `make demo`)
 make fuzz       # run every fuzz test for FUZZTIME (default 30s) each
+make soak       # SOAKTIME (default 10m) of mixed load, killing database connections every 20 s
 make demo       # throwaway Postgres on :55432 with sample data (password: secret)
 ```
 

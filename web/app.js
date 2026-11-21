@@ -1332,11 +1332,22 @@ class RowStore {
       this.holds = this.holds.filter((h) => h !== hold);
     }
   }
+  // In the default order, a page next to a loaded one is fetched from that
+  // page's edge key: deep in a big table this skips OFFSET's scan of every
+  // earlier row. A jump far away still uses the offset.
+  anchor(p) {
+    const v = this.view;
+    if (v.settings.sort.length || !v.meta.keyMode) return {};
+    const prev = this.pages.get(p - 1), next = this.pages.get(p + 1);
+    if (prev && prev.length === PAGE) return { after: v.resolveKey(v.keyOf(prev[PAGE - 1])) };
+    if (next && next.length) return { before: v.resolveKey(v.keyOf(next[0])) };
+    return {};
+  }
   async fetch(p) {
     const gen = this.gen;
     this.view.loading(true);
     try {
-      const res = await api("rows", { ...this.view.query(), offset: p * PAGE, limit: PAGE }, { signal: this.ctl.signal });
+      const res = await api("rows", { ...this.view.query(), ...this.anchor(p), offset: p * PAGE, limit: PAGE }, { signal: this.ctl.signal });
       if (gen !== this.gen) return;
       this.pages.set(p, res.rows);
       this.evict();

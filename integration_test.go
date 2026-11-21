@@ -828,3 +828,122 @@ func TestIntegrationCSVEscaping(t *testing.T) {
 		t.Fatalf("bad filter: %d %v", code, res)
 	}
 }
+
+// Keyset pages are exactly the OFFSET pages, forwards and backwards, for
+// every kind of row key, with and without filters.
+func TestIntegrationKeysetMatchesOffset(t *testing.T) {
+	db := testDB(t, `CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');
+		CREATE TABLE ints (id int PRIMARY KEY, v text);
+		INSERT INTO ints SELECT g, 'v' || (g % 7) FROM generate_series(1, 53) g;
+		CREATE TABLE comp (a text, b int, v text, PRIMARY KEY (a, b));
+		INSERT INTO comp SELECT chr(65 + g % 5) || CASE WHEN g % 3 = 0 THEN ' x' ELSE 'é' END, g, 'v' FROM generate_series(1, 41) g;
+		CREATE TABLE uu (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), v int);
+		INSERT INTO uu (v) SELECT g FROM generate_series(1, 30) g;
+		CREATE TABLE en (m mood, n int, PRIMARY KEY (m, n));
+		INSERT INTO en SELECT (ARRAY['sad','ok','happy'])[1 + g % 3]::mood, g FROM generate_series(1, 25) g;
+		CREATE TABLE nopk (v int);
+		INSERT INTO nopk SELECT g FROM generate_series(1, 44) g;
+		DELETE FROM nopk WHERE v % 5 = 0;`)
+	a := newApp(config{addr: "127.0.0.1:0"})
+	defer a.closeAll()
+	c := signIn(t, a, db)
+	c.db = db
+	page := func(body map[string]any) []any {
+		t.Helper()
+		code, out := c.call("rows", body)
+		if code != 200 {
+			t.Fatalf("rows %v: %d %v", body, code, out)
+		}
+		return out["rows"].([]any)
+	}
+	keyOf := func(m map[string]any, row []any) map[string]any {
+		if m["keyMode"] == "ctid" {
+			return map[string]any{"__ctid": row[0]}
+		}
+		k := map[string]any{}
+		for _, p := range m["pk"].([]any) {
+			for i, col := range m["columns"].([]any) {
+				if col.(map[string]any)["name"] == p {
+					k[p.(string)] = row[i]
+				}
+			}
+		}
+		return k
+	}
+	const n = 7
+	for _, tc := range []struct {
+		table   string
+		filters []any
+	}{
+		{"ints", nil},
+		{"ints", []any{map[string]any{"col": "v", "op": "eq", "val": "v3"}}},
+		{"ints", []any{map[string]any{"op": "sql", "val": "id % 2 = 0"}}},
+		{"comp", nil},
+		{"uu", nil},
+		{"en", nil},
+		{"nopk", nil},
+	} {
+		_, m := c.call("table", map[string]any{"schema": "public", "name": tc.table})
+		base := func() map[string]any {
+			return map[string]any{"schema": "public", "name": tc.table, "limit": n, "filters": tc.filters}
+		}
+		var byOffset [][]any
+		for off := 0; ; off += n {
+			b := base()
+			b["offset"] = off
+			p := page(b)
+			if len(p) == 0 {
+				break
+			}
+			byOffset = append(byOffset, p)
+		}
+		// forwards
+		for i := 1; i < len(byOffset); i++ {
+			prev := byOffset[i-1]
+			b := base()
+			b["after"] = keyOf(m, prev[len(prev)-1].([]any))
+			if got := page(b); fmt.Sprint(got) != fmt.Sprint(byOffset[i]) {
+				t.Fatalf("%s %v: page %d after key differs:\n%v\n%v", tc.table, tc.filters, i, got, byOffset[i])
+			}
+		}
+		// backwards
+		for i := len(byOffset) - 2; i >= 0; i-- {
+			b := base()
+			b["before"] = keyOf(m, byOffset[i+1][0].([]any))
+			if got := page(b); fmt.Sprint(got) != fmt.Sprint(byOffset[i]) {
+				t.Fatalf("%s %v: page %d before key differs:\n%v\n%v", tc.table, tc.filters, i, got, byOffset[i])
+			}
+		}
+	}
+	// A user sort falls back to OFFSET.
+	_, out := c.call("rows", map[string]any{"schema": "public", "name": "ints", "sort": []any{map[string]any{"col": "v"}}, "after": map[string]any{"id": "3"}, "offset": 0, "limit": 5})
+	if out["keyset"] != false || out["rows"].([]any)[0].([]any)[1] != "v0" {
+		t.Fatalf("sorted view: %v", out)
+	}
+}
+
+func TestIntegrationKeysetIsFastDeepDown(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds a 2-million-row table")
+	}
+	db := testDB(t, `CREATE TABLE big (id int PRIMARY KEY, v text);
+		INSERT INTO big SELECT g, md5(g::text) FROM generate_series(1, 2000000) g; ANALYZE big;`)
+	a := newApp(config{addr: "127.0.0.1:0"})
+	defer a.closeAll()
+	c := signIn(t, a, db)
+	c.db = db
+	timeIt := func(body map[string]any) (time.Duration, []any) {
+		start := time.Now()
+		_, out := c.call("rows", body)
+		return time.Since(start), out["rows"].([]any)
+	}
+	off, rowsOff := timeIt(map[string]any{"schema": "public", "name": "big", "offset": 1900000, "limit": 200})
+	ks, rowsKs := timeIt(map[string]any{"schema": "public", "name": "big", "after": map[string]any{"id": "1900000"}, "limit": 200})
+	if fmt.Sprint(rowsOff) != fmt.Sprint(rowsKs) {
+		t.Fatal("pages differ")
+	}
+	t.Logf("row 1,900,000: OFFSET %v, keyset %v", off, ks)
+	if ks*5 > off {
+		t.Fatalf("keyset (%v) not much faster than OFFSET (%v)", ks, off)
+	}
+}

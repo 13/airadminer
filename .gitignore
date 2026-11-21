@@ -1,3 +1,4 @@
 /airadminer
 /dist/
 /e2e/server.log
+/e2e/server-nosql.log

@@ -294,6 +294,29 @@ const tests = {
     `);
   },
 
+  async "scrolling deep in the default order pages by key"(sc) {
+    return run(`
+      await sql("CREATE TABLE ${sc}.items (id int PRIMARY KEY, v text); INSERT INTO ${sc}.items SELECT g, 'v' || g FROM generate_series(1, 20000) g");
+      await open_("${sc}", "items");
+      const bodies = [], orig = window.fetch;
+      window.fetch = (u, o) => { if (String(u).endsWith("api/rows")) bodies.push(JSON.parse(o.body)); return orig(u, o); };
+      try {
+        const g = S.view.grid, at = 15000;
+        g.sc.scrollTop = at * g.rh; g.draw();
+        await until(() => S.view.rows.get(at), "jump");
+        for (let r = at; r < at + 2000; r += 200) { g.sc.scrollTop = r * g.rh; g.draw(); await until(() => S.view.rows.get(r + 199), "down " + r); }
+        for (let r = at; r > at - 2000; r -= 200) { g.sc.scrollTop = r * g.rh; g.draw(); await until(() => S.view.rows.get(r - 200), "up " + r); }
+        for (let r = at - 2000; r < at + 2000; r++) {
+          const row = S.view.rows.get(r);
+          if (!row) throw new Error("row " + r + " not loaded");
+          if (row[0] !== String(r + 1)) throw new Error("row " + r + " is id " + row[0]);
+        }
+        const keyed = bodies.filter((b) => b.after || b.before).length;
+        if (keyed < 15) throw new Error("only " + keyed + " of " + bodies.length + " page requests used a key");
+      } finally { window.fetch = orig; }
+    `);
+  },
+
   async "the footer adds big integers exactly"(sc) {
     return run(`
       await sql("CREATE TABLE ${sc}.items (id int PRIMARY KEY, n bigint); INSERT INTO ${sc}.items VALUES (1, 9007199254740993), (2, 1)");
@@ -320,6 +343,28 @@ const tests = {
   },
 };
 
+// Run against a server started with -no-sql (E2E_SUITE=nosql).
+const nosqlTests = {
+  async "with -no-sql the SQL editor and SQL filters are gone"() {
+    return run(`
+      if (S.meta.sql !== false) throw new Error("server is not in -no-sql mode");
+      if (document.querySelector("[data-sqllink]")) throw new Error("the sidebar links to the SQL editor");
+      location.hash = "#/sql";
+      await until(() => S.view && S.view.meta && S.view.rows && S.view.rows.ready, "a table instead of the editor");
+      document.querySelector("[data-filter]").click();
+      await until(() => document.querySelector(".rules.pop"), "filter menu");
+      if (document.querySelector("[data-addsql]")) throw new Error("the filter menu offers SQL conditions");
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "k", ctrlKey: true, metaKey: true, bubbles: true }));
+      await until(() => document.querySelector(".palette"), "command palette");
+      if (/SQL editor/.test(document.querySelector(".palette").textContent)) throw new Error("the palette offers the SQL editor");
+      const status = await api("query", { sql: "SELECT 1" }).then(() => 200, (e) => e.status);
+      if (status !== 403) throw new Error("the query endpoint answered " + status);
+    `);
+  },
+};
+const nosql = process.env.E2E_SUITE === "nosql";
+
 let failed = 0;
 try {
   await connect();
@@ -332,17 +377,17 @@ try {
     await sleep(50);
   }
   await run(helpers);
-  for (const [name, fn] of Object.entries(tests)) {
+  for (const [name, fn] of Object.entries(nosql ? nosqlTests : tests)) {
     const sc = "e2e_" + Math.random().toString(36).slice(2, 8);
     try {
-      await run(`document.querySelectorAll(".toast").forEach((t) => t.remove()); await sql("CREATE SCHEMA ${sc}"); return true;`);
+      await run(`document.querySelectorAll(".toast").forEach((t) => t.remove()); ${nosql ? "" : `await sql("CREATE SCHEMA ${sc}");`} return true;`);
       await fn(sc);
       console.log("ok   " + name);
     } catch (e) {
       failed++;
       console.log("FAIL " + name + "\n     " + String(e.message || e).split("\n")[0]);
     } finally {
-      await run(`try { await closeDrawer(true); } catch {} location.hash = ""; await sql("DROP SCHEMA IF EXISTS ${sc} CASCADE"); return true;`).catch(() => {});
+      await run(`try { await closeDrawer(true); } catch {} location.hash = ""; ${nosql ? "" : `await sql("DROP SCHEMA IF EXISTS ${sc} CASCADE");`} return true;`).catch(() => {});
     }
   }
   const errs = pageErrors.filter((e) => !/clipboard|Clipboard|Document is not focused/.test(e));

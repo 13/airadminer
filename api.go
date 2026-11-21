@@ -140,7 +140,7 @@ func writeErr(w http.ResponseWriter, err error) {
 		index = &be.index
 	}
 	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) {
+	if errors.As(err, &pgErr) && !connLost(err) {
 		writeJSON(w, http.StatusBadRequest, apiErr{Error: pgErr.Message, Detail: pgErr.Detail, Hint: pgErr.Hint, Code: pgErr.Code, Position: pgErr.Position, Index: index})
 		return
 	}
@@ -167,11 +167,29 @@ func writeErr(w http.ResponseWriter, err error) {
 // reached or the connection broke, as opposed to a rejected statement.
 func isUnavailable(err error) bool {
 	var ce *pgconn.ConnectError
-	if errors.As(err, &ce) || pgconn.SafeToRetry(err) || errors.Is(err, errBusy) || errors.Is(err, errLongBusy) {
+	if errors.As(err, &ce) || pgconn.SafeToRetry(err) || errors.Is(err, errBusy) || errors.Is(err, errLongBusy) || connLost(err) {
 		return true
 	}
 	var ne net.Error
 	return errors.As(err, &ne)
+}
+
+// connLost reports a connection the server dropped or that broke, such as
+// during a database restart or failover, as opposed to a failed statement.
+func connLost(err error) bool {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		switch pgErr.Code {
+		case "57P01", "57P02", "57P03": // admin_shutdown, crash_shutdown, cannot_connect_now
+			return true
+		}
+		return strings.HasPrefix(pgErr.Code, "08") // connection exceptions
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var ne net.Error
+	return errors.As(err, &ne) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || strings.Contains(err.Error(), "conn closed")
 }
 
 func decode(r *http.Request, v any) error {
@@ -350,6 +368,46 @@ type viewReq struct {
 	Search  string       `json:"search"`
 	Offset  int64        `json:"offset"`
 	Limit   int64        `json:"limit"`
+	// Keyset paging: the rows right after (or before) the record with this
+	// key, in the default order. Used instead of Offset when given.
+	After  rowKey `json:"after"`
+	Before rowKey `json:"before"`
+}
+
+// keyset returns the condition and order for paging from a key, or ok=false
+// when the view cannot page that way: with a sort of the user's own, NULLs
+// and mixed directions would need a far more complex condition, so those
+// views use OFFSET.
+func keyset(m *TableMeta, req *viewReq, args *sqlArgs) (cond, order string, reverse, ok bool, err error) {
+	key, op, dir := req.After, " > ", ""
+	if key == nil {
+		key, op, dir, reverse = req.Before, " < ", " DESC", true
+	}
+	if key == nil || len(req.Sort) > 0 {
+		return "", "", false, false, nil
+	}
+	switch m.KeyMode {
+	case "pk":
+		var cols, vals, ord []string
+		for _, p := range m.PK {
+			v, has := key[p]
+			if !has || v == nil {
+				return "", "", false, false, fmt.Errorf("missing primary key value for %q", p)
+			}
+			cols = append(cols, ident(p))
+			vals = append(vals, args.add(v))
+			ord = append(ord, ident(p)+dir)
+		}
+		return "(" + strings.Join(cols, ", ") + ")" + op + "(" + strings.Join(vals, ", ") + ")", " ORDER BY " + strings.Join(ord, ", "), reverse, true, nil
+	case "ctid":
+		v := key["__ctid"]
+		if v == nil {
+			return "", "", false, false, errors.New("missing row id")
+		}
+		tid, _, _ := strings.Cut(*v, ":")
+		return "ctid" + op + args.add(&tid) + "::tid", " ORDER BY ctid" + dir, reverse, true, nil
+	}
+	return "", "", false, false, nil
 }
 
 const rowAlias = `"__airadminer_row"`
@@ -463,6 +521,26 @@ func buildWhere(m *TableMeta, req *viewReq, args *sqlArgs) (string, error) {
 	return " WHERE " + strings.Join(conds, " AND "), nil
 }
 
+// outerOrder rewrites an ORDER BY for the page subquery, where the system
+// column ctid is available as "__aa_ctid". Quoted identifiers are skipped.
+func outerOrder(order string) string {
+	var b strings.Builder
+	quoted := false
+	for i := 0; i < len(order); i++ {
+		c := order[i]
+		if c == '"' {
+			quoted = !quoted
+		}
+		if !quoted && strings.HasPrefix(order[i:], "ctid") && (i == 0 || order[i-1] == ' ') && (i+4 == len(order) || order[i+4] == ' ' || order[i+4] == ',') {
+			b.WriteString(`"__aa_ctid"`)
+			i += 3
+			continue
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
+}
+
 func buildOrder(m *TableMeta, req *viewReq) (string, error) {
 	var parts []string
 	seen := map[string]bool{}
@@ -500,11 +578,17 @@ func buildOrder(m *TableMeta, req *viewReq) (string, error) {
 // and long values are cut (see cells.go): the md5 of each cut column's
 // full text follows the visible columns, for finishRow to fold in.
 func selectList(m *TableMeta, forExport bool) string {
+	return selectListWith(m, forExport, "ctid", "xmin")
+}
+
+// selectListWith reads the row id from the given ctid and xmin columns:
+// the system columns, or their copies when selecting from a subquery.
+func selectListWith(m *TableMeta, forExport bool, ctid, xmin string) string {
 	var parts, hashes []string
 	if m.KeyMode == "ctid" && !forExport {
 		// ctid alone is a slot that VACUUM can hand to another row; with
 		// xmin the key names exactly this version of this row.
-		parts = append(parts, `ctid::text || ':' || xmin::text AS "__ctid"`)
+		parts = append(parts, ctid+`::text || ':' || `+xmin+`::text AS "__ctid"`)
 	}
 	cut := 0
 	if !forExport {
@@ -561,14 +645,41 @@ func (a *App) handleRows(s *Session, db *DB, w http.ResponseWriter, r *http.Requ
 	if req.Offset < 0 {
 		req.Offset = 0
 	}
-	sql := "SELECT " + selectList(m, false) + " FROM " + ident(m.Schema, m.Name) + " AS " + rowAlias +
-		where + order + fmt.Sprintf(" LIMIT %d OFFSET %d", req.Limit, req.Offset)
+	page := fmt.Sprintf(" LIMIT %d OFFSET %d", req.Limit, req.Offset)
+	// Deep in a big table OFFSET reads and throws away every earlier row;
+	// paging from the neighbouring page's key goes straight to the spot.
+	cond, korder, reverse, ok, err := keyset(m, &req, args)
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		if where == "" {
+			where = " WHERE " + cond
+		} else {
+			where += " AND " + cond
+		}
+		order, page = korder, fmt.Sprintf(" LIMIT %d", req.Limit)
+	}
+	// The page is cut out in a subquery of plain columns, and the grid's
+	// expressions (cut text, md5) run only for the rows returned: with a
+	// large OFFSET they would otherwise run for every row skipped.
+	sys := ""
+	if m.KeyMode == "ctid" {
+		sys = `, ctid AS "__aa_ctid", xmin AS "__aa_xmin"`
+	}
+	inner := "SELECT " + rowAlias + ".*" + sys + " FROM " + ident(m.Schema, m.Name) + " AS " + rowAlias + where + order + page
+	sql := "SELECT " + selectListWith(m, false, `"__aa_ctid"`, `"__aa_xmin"`) + " FROM (" + inner + ") AS " + rowAlias + outerOrder(order)
 	start := time.Now()
 	res, err := db.execText(ctx, sql, args.vals, req.hasRawSQL())
 	if err != nil {
 		return nil, err
 	}
-	return map[string]any{"rows": finishRows(m, res.rows), "ms": time.Since(start).Milliseconds()}, nil
+	if reverse {
+		for i, j := 0, len(res.rows)-1; i < j; i, j = i+1, j-1 {
+			res.rows[i], res.rows[j] = res.rows[j], res.rows[i]
+		}
+	}
+	return map[string]any{"rows": finishRows(m, res.rows), "ms": time.Since(start).Milliseconds(), "keyset": ok}, nil
 }
 
 func (a *App) handleCount(s *Session, db *DB, w http.ResponseWriter, r *http.Request) (any, error) {
@@ -1319,6 +1430,18 @@ func textRow(vals [][]byte) []any {
 // execText runs one parameterised statement and returns every value in
 // PostgreSQL's own text format, so the browser sees exactly what psql would.
 func (db *DB) execText(ctx context.Context, sql string, params [][]byte, userSQL bool) (*textResult, error) {
+	res, err := db.execTextOnce(ctx, sql, params, userSQL)
+	// A pooled connection the server dropped (restart, failover, killed
+	// backend) fails the first statement sent on it. These statements only
+	// read, so try once more on a fresh connection; not with SQL the user
+	// wrote, which might do more than read.
+	if err != nil && !userSQL && ctx.Err() == nil && connLost(err) {
+		res, err = db.execTextOnce(ctx, sql, params, userSQL)
+	}
+	return res, err
+}
+
+func (db *DB) execTextOnce(ctx context.Context, sql string, params [][]byte, userSQL bool) (*textResult, error) {
 	conn, err := db.acquire(ctx)
 	if err != nil {
 		return nil, err

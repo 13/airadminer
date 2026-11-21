@@ -2,7 +2,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 PLATFORMS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64
 
-.PHONY: build run test test-integration e2e fuzz lint dist clean demo
+.PHONY: build run test test-integration e2e fuzz soak lint dist clean demo
 
 build:
 	CGO_ENABLED=0 go build -trimpath -ldflags '$(LDFLAGS)' -o airadminer .
@@ -22,6 +22,11 @@ test-integration:
 # Browser tests of the grid in headless Chrome (needs `make demo` and google-chrome)
 e2e: build
 	./e2e/run.sh
+
+# Mixed load over HTTP with database connections killed every 20 s (needs `make demo`)
+SOAKTIME ?= 10m
+soak:
+	AIRADMINER_SOAK=$(SOAKTIME) AIRADMINER_TEST_DSN=$${AIRADMINER_TEST_DSN:-postgres://postgres:secret@127.0.0.1:55432/postgres} go test -count=1 -v -run TestSoak -timeout 0 .
 
 FUZZTIME ?= 30s
 fuzz:
