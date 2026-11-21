@@ -45,7 +45,7 @@ There is no runtime, no Node build, no config file, and no external assets. The 
 Build once with Go 1.25 or newer, then copy the binary anywhere. It has no dependencies, not even libc:
 
 ```sh
-make build          # or: make dist, for every platform
+make build          # or: make dist, for a linux/amd64 release binary
 ```
 
 Docker (about 16 MB, built `FROM scratch`):
@@ -149,7 +149,7 @@ Writes are addressed by record, not by position on screen. An edit still lands o
 
 ```sh
 make build      # ./airadminer for this machine
-make dist       # static binaries for linux/darwin/windows × amd64/arm64 in ./dist
+make dist       # static linux/amd64 binary in ./dist (override with PLATFORMS="os/arch ...")
 make test       # go vet, go test -race, JS syntax check
 make lint       # gofmt, vet, staticcheck, govulncheck
 make test-integration  # tests against PostgreSQL (needs `make demo` running)

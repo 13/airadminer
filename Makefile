@@ -1,6 +1,6 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
-PLATFORMS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64
+PLATFORMS ?= linux/amd64
 
 .PHONY: build run test test-integration e2e fuzz soak lint dist clean demo
 
@@ -40,7 +40,7 @@ lint:
 	go run honnef.co/go/tools/cmd/staticcheck@latest ./...
 	go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
-# Static binaries for every platform in ./dist
+# Static binaries in ./dist (linux/amd64; override with PLATFORMS="os/arch ...")
 dist:
 	@mkdir -p dist
 	@for p in $(PLATFORMS); do \
