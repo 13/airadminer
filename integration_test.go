@@ -275,3 +275,69 @@ func TestIntegrationFailedBatchRollsBack(t *testing.T) {
 		t.Fatalf("partial batch committed: %v", v)
 	}
 }
+
+// H4: the expected values the browser sends are the text it received. That
+// text must compare equal for every common type, or edits would be refused
+// spuriously. And a cell changed by someone else must make the edit fail.
+func TestIntegrationExpectRoundTripsAndDetectsConflicts(t *testing.T) {
+	db := testDB(t, `CREATE TYPE mood AS ENUM ('ok', 'sad');
+		CREATE TABLE t (id int PRIMARY KEY, j json, jb jsonb, f float8, r real, n numeric, ts timestamptz, d date,
+		  b bool, a int[], m mood, u uuid, iv interval, ip inet, big bigint, x text, bin bytea, host inet, ch char(5), xm xml, pt point, tsr tstzrange, bits bit varying(8), money money);
+		INSERT INTO t VALUES (1, '{"b": 1,  "a": 12345678901234567890}', '{"z": [1, 2.50]}', 0.1, 1.1, 1.10,
+		  '2025-01-02 03:04:05.123456+00', '2025-01-02', true, '{1,NULL,3}', 'sad', gen_random_uuid(), '1 day 02:03:04',
+		  '10.0.0.1/8', 9223372036854775807, E'line\nnext', '\xdeadbeef', '10.0.0.1', 'ab', '<a>1</a>', '(1.5,2)', '[2025-01-01,2025-02-01)', B'101', 12.34);`)
+	a := newApp(config{addr: "127.0.0.1:0"})
+	defer a.closeAll()
+	c := signIn(t, a, db)
+	c.db = db
+	ref := map[string]any{"schema": "public", "name": "t"}
+	_, out := c.call("table", ref)
+	var names []string
+	for _, col := range out["columns"].([]any) {
+		names = append(names, col.(map[string]any)["name"].(string))
+	}
+	_, out = c.call("rows", ref)
+	row := out["rows"].([]any)[0].([]any)
+	expect := map[string]any{}
+	for i, n := range names {
+		if n != "id" {
+			expect[n] = row[i]
+		}
+	}
+	for n, v := range expect {
+		if code, res := c.call("update", map[string]any{"schema": "public", "name": "t", "key": map[string]any{"id": "1"}, "values": map[string]any{"id": "1"}, "expect": map[string]any{n: v}}); code != 200 {
+			t.Errorf("column %s: text %v does not compare equal: %v", n, v, res)
+		}
+	}
+	code, res := c.call("update", map[string]any{"schema": "public", "name": "t", "key": map[string]any{"id": "1"}, "values": map[string]any{"x": "changed"}, "expect": expect})
+	if code != 200 {
+		t.Fatalf("expect with unchanged values refused: %v", res)
+	}
+
+	// Someone else changes x; an edit based on the old value must fail.
+	u := testDSN(t)
+	du := *u
+	du.Path = "/" + db
+	other, err := pgx.Connect(context.Background(), du.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close(context.Background())
+	if _, err := other.Exec(context.Background(), "UPDATE t SET x = 'theirs'"); err != nil {
+		t.Fatal(err)
+	}
+	code, res = c.call("update", map[string]any{"schema": "public", "name": "t", "key": map[string]any{"id": "1"}, "values": map[string]any{"x": "mine"}, "expect": map[string]any{"x": "changed"}})
+	if code == 200 {
+		t.Fatalf("overwrote a concurrent change: %v", res)
+	}
+	var x string
+	other.QueryRow(context.Background(), "SELECT x FROM t").Scan(&x)
+	if x != "theirs" {
+		t.Fatalf("x = %q", x)
+	}
+	// Expecting NULL works too.
+	other.Exec(context.Background(), "UPDATE t SET x = NULL")
+	if code, res = c.call("update", map[string]any{"schema": "public", "name": "t", "key": map[string]any{"id": "1"}, "values": map[string]any{"x": "set"}, "expect": map[string]any{"x": nil}}); code != 200 {
+		t.Fatalf("expect null: %v", res)
+	}
+}

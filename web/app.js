@@ -1,6 +1,7 @@
 /* airadminer client: plain JavaScript, no build step, no dependencies. */
 "use strict";
 (() => {
+const E2E = window.__AA_E2E;
 
 // ============================================================ utilities
 
@@ -166,6 +167,7 @@ function menuKeys(root, input) {
 }
 
 function dialog({ title, body, ok = "Delete", cancel = "Cancel", danger = true }) {
+  if (E2E && E2E.confirm) return Promise.resolve(true);
   return new Promise((resolve) => {
     const scrim = html(`<div class="scrim" style="z-index:60"></div>`);
     const d = html(`<div class="pop dialog" role="alertdialog" aria-modal="true">
@@ -290,6 +292,45 @@ function renderValue(col, v, tall) {
     }
     default: return `<span class="v v-mono">${esc(v.length > 600 ? v.slice(0, 600) + "…" : v)}</span>`;
   }
+}
+
+// The last block copied from a grid, with its NULLs. TSV has no NULL, so a
+// paste of exactly this text uses the matrix instead of the text.
+let lastCopy = null;
+function copyMatrix(matrix) {
+  const text = toTSV(matrix);
+  lastCopy = { text: text.replace(/\r\n?/g, "\n"), matrix };
+  return copyText(text);
+}
+function pastedMatrix(text) {
+  return lastCopy && text.replace(/\r\n?/g, "\n") === lastCopy.text ? lastCopy.matrix : parseTSV(text);
+}
+
+// Re-indents JSON by changing whitespace only: numbers, strings and key
+// order stay exactly as written (JSON.parse would round big numbers).
+function prettyJSON(src) {
+  try { JSON.parse(src); } catch { return null; }
+  let out = "", ind = 0;
+  const nl = () => "\n" + "  ".repeat(ind);
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i];
+    if (ch === '"') {
+      let j = i + 1;
+      while (j < src.length && src[j] !== '"') j += src[j] === "\\" ? 2 : 1;
+      out += src.slice(i, j + 1); i = j;
+    } else if (ch === " " || ch === "\t" || ch === "\n" || ch === "\r") {
+      continue;
+    } else if (ch === "{" || ch === "[") {
+      let j = i + 1;
+      while (" \t\n\r".includes(src[j])) j++;
+      if (src[j] === (ch === "{" ? "}" : "]")) { out += ch + src[j]; i = j; continue; }
+      ind++; out += ch + nl();
+    } else if (ch === "}" || ch === "]") { ind--; out += nl() + ch; }
+    else if (ch === ",") out += "," + nl();
+    else if (ch === ":") out += ": ";
+    else out += ch;
+  }
+  return out;
 }
 
 // TSV in the dialect spreadsheets use, so copy/paste round-trips with Sheets/Excel/Airtable.
@@ -598,7 +639,7 @@ class Grid {
       if (e.target.closest("[data-link]") && this.o.onLink) { this.o.onLink(hit.r, col); return; }
       if (col.kind === "bool" && e.target.closest(".chk") && !col.readonly && this.o.onEdit) {
         const row = this.o.source.get(hit.r);
-        if (row) this.o.onEdit(hit.r, col, isTrue(row[col.idx]) ? "false" : "true");
+        if (row) this.o.onEdit(hit.r, col, isTrue(row[col.idx]) ? "false" : "true", row);
         return;
       }
       if (isDouble || (wasActive && col.kind === "enum")) { this.startEdit(); return; }
@@ -634,7 +675,7 @@ class Grid {
       const text = e.clipboardData.getData("text/plain");
       if (!text) return;
       e.preventDefault();
-      this.o.onPaste(this.norm(), parseTSV(text));
+      this.o.onPaste(this.norm(), pastedMatrix(text));
     };
     document.addEventListener("paste", this.onPasteEv);
   }
@@ -715,7 +756,7 @@ class Grid {
       for (let c = s.c0; c <= s.c1; c++) line.push(row[this.cols[c].idx]);
       out.push(line);
     }
-    copyText(toTSV(out));
+    copyMatrix(out);
     const cells = out.length * (s.c1 - s.c0 + 1);
     toast(cells === 1 ? "Copied" : `Copied ${plural(cells, "cell")}` + (missing ? ` (${fmtN(missing)} rows were not loaded yet)` : ""));
   }
@@ -732,12 +773,12 @@ class Grid {
     this.paintSel();
     const v = row[col.idx];
     const readonly = col.readonly || !this.o.onEdit;
-    if (!readonly && col.kind === "bool") { this.o.onEdit(r, col, isTrue(v) ? "false" : "true"); return; }
+    if (!readonly && col.kind === "bool") { this.o.onEdit(r, col, isTrue(v) ? "false" : "true", row); return; }
     if (!readonly && col.kind === "enum" && col.enum) { this.enumPicker(r, c, col, v); return; }
     if (readonly && col.kind === "blob") return;
 
     let text = v ?? "";
-    if (readonly && col.kind === "json" && v) { try { text = JSON.stringify(JSON.parse(v), null, 2); } catch {} }
+    if (readonly && col.kind === "json" && v) text = prettyJSON(v) ?? v;
     const multi = col.kind === "json" || (col.kind === "text" && (/\n/.test(text) || text.length > 40)) || (readonly && text.length > 40);
     const ed = html(`<div class="g-editor ${["json", "uuid", "num", "array", "range", "other", "net"].includes(col.kind) ? "mono" : ""}"></div>`);
     const input = document.createElement(multi ? "textarea" : "input");
@@ -751,7 +792,7 @@ class Grid {
       ed.appendChild(html(`<div class="hint">${readonly ? "<span>Read-only</span><span>Esc closes</span>" : `<span>Enter saves</span>${multi ? "<span>Shift+Enter adds a line</span>" : ""}<span>Esc cancels</span>`}</div>`));
     }
     this.sc.appendChild(ed);
-    this.editor = { r, c, col, el: ed, input, orig: v, multi, readonly, initial };
+    this.editor = { r, c, col, row, el: ed, input, orig: v, multi, readonly, initial };
     this.placeEditor();
     input.focus();
     if (initial == null) input.select(); else input.setSelectionRange(input.value.length, input.value.length);
@@ -781,6 +822,7 @@ class Grid {
   enumPicker(r, c, col, v) {
     const cell = this.cellEl(r, c);
     if (!cell) return;
+    const row = this.o.source.get(r);
     const opts = [...col.enum.map((x) => ({ v: x, h: (col.enum.indexOf(x) * 67 + 205) % 360 })), ...(col.nullable ? [{ v: null }] : [])];
     const el = html(`<div class="scroll">${opts.map((o, i) => `<button class="mi ${o.v === v ? "on" : ""}" data-i="${i}">${o.v === null ? `<span class="v-null">null</span>` : `<span class="pill" style="--h:${o.h}">${esc(o.v)}</span>`}${o.v === v ? `<span class="r">${icon("i-check", "sm")}</span>` : ""}</button>`).join("")}</div>`);
     const wrap = html(`<div></div>`); wrap.appendChild(el);
@@ -793,7 +835,7 @@ class Grid {
       if (!b) return;
       const val = opts[+b.dataset.i].v;
       closePop();
-      if (val !== v) this.o.onEdit(r, col, val);
+      if (val !== v && row) this.o.onEdit(r, col, val, row);
     });
     return p;
   }
@@ -850,7 +892,7 @@ class Grid {
       let val = ed.input.value;
       const blankIsNull = !["text"].includes(ed.col.kind);
       if (val === "" && (ed.orig === null || blankIsNull)) val = ed.col.nullable === false && !blankIsNull ? "" : null;
-      if (val !== ed.orig) this.o.onEdit(ed.r, ed.col, val);
+      if (val !== ed.orig) this.o.onEdit(ed.r, ed.col, val, ed.row);
     }
     if (dr || dc) this.select(ed.r + dr, ed.c + dc);
   }
@@ -877,10 +919,25 @@ const S = {
 const app = $("#app");
 
 function signedOut() {
+  if (!S.meta && !S.view) return; // several requests can see the same 401
+  closeDrawer(true);
   if (S.view && S.view.destroy) S.view.destroy();
   S.view = null; S.meta = null;
   closePop();
   renderLogin();
+}
+
+// Signing out on purpose also forgets SQL text and history kept in this
+// browser, which may hold passwords or personal data.
+async function signOut() {
+  try { await api("logout"); } catch {}
+  try {
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith("aa.sql.")) localStorage.removeItem(k);
+    }
+  } catch {}
+  signedOut();
 }
 
 async function boot() {
@@ -992,7 +1049,7 @@ async function renderShell() {
   });
   $("[data-db]").onclick = (e) => dbMenu(e.currentTarget);
   $("[data-themebtn]").onclick = cycleTheme;
-  $("[data-logout]").onclick = async () => { try { await api("logout"); } catch {} signedOut(); };
+  $("[data-logout]").onclick = signOut;
   $("[data-list]").addEventListener("click", (e) => {
     const h = e.target.closest("[data-schema]");
     if (h) {
@@ -1148,7 +1205,7 @@ class RowStore {
   reset() {
     this.gen++;
     this.pages = new Map();
-    this.inflight = new Set();
+    this.inflight = new Map(); // page -> promise
     this.total = 0;
     this.exact = false;
     this.ready = false;
@@ -1166,12 +1223,25 @@ class RowStore {
     if (!this.want) return;
     const [a, b] = this.want;
     for (let p = Math.floor(a / PAGE); p <= Math.floor(Math.min(b, Math.max(0, this.total - 1)) / PAGE); p++) {
-      if (!this.pages.has(p) && !this.inflight.has(p)) this.fetch(p);
+      if (!this.pages.has(p) && !this.inflight.has(p)) this.inflight.set(p, this.fetch(p));
     }
+  }
+  // Loads every page that covers rows a..b. Resolves false if the view was
+  // reset meanwhile or a page failed to load.
+  async loadRange(a, b) {
+    const gen = this.gen;
+    for (let p = Math.floor(a / PAGE); p <= Math.floor(b / PAGE); p++) {
+      if (this.exact && p * PAGE >= this.total) break;
+      if (!this.pages.has(p)) {
+        if (!this.inflight.has(p)) this.inflight.set(p, this.fetch(p));
+        await this.inflight.get(p);
+      }
+      if (gen !== this.gen || !this.pages.has(p)) return false;
+    }
+    return true;
   }
   async fetch(p) {
     const gen = this.gen;
-    this.inflight.add(p);
     this.view.loading(true);
     try {
       const res = await api("rows", { ...this.view.query(), offset: p * PAGE, limit: PAGE });
@@ -1190,14 +1260,17 @@ class RowStore {
     } catch (e) {
       if (gen === this.gen) toastErr(e);
     } finally {
-      this.inflight.delete(p);
-      if (gen === this.gen && !this.inflight.size) this.view.loading(false);
+      if (gen === this.gen) {
+        this.inflight.delete(p);
+        if (!this.inflight.size) this.view.loading(false);
+      }
     }
   }
   async start() {
     const gen = this.gen;
     const q = this.view.query();
     const first = this.fetch(0);
+    this.inflight.set(0, first);
     api("count", q).then((r) => {
       if (gen !== this.gen) return;
       if (this.exact && r.exact) { this.total = r.count; }
@@ -1239,6 +1312,8 @@ class TableView {
     this.ref = { schema: ref.schema, name: ref.name };
     this.tab = ref.tab;
     this.undo = [];
+    this.renamed = new Map(); // JSON(old key) -> new key
+    this.writeChain = Promise.resolve();
     this.lastMs = null;
     this.key = `aa.v:${S.meta.database}:${ref.schema}.${ref.name}`;
     this.settings = Object.assign({ hidden: [], widths: {}, sort: [], filters: [], rh: 0, search: "" }, store.get(this.key, {}));
@@ -1315,7 +1390,7 @@ class TableView {
       pick: this.editable,
       onExpand: (r) => this.expand(r),
       onAdd: this.editable ? () => openRecord({ meta: this.meta, view: this, isNew: true }) : null,
-      onEdit: this.editable ? (r, col, v) => this.writeCell(r, col.name, v) : null,
+      onEdit: this.editable ? (r, col, v, row) => this.writeCell(r, col.name, v, row) : null,
       onHeader: (col, el) => this.columnMenu(col, el),
       onResize: (col) => { this.settings.widths[col.name] = col.width; this.save(); },
       onLink: (r, col) => { const row = this.rows.get(r); if (row && row[col.idx] != null) openLinked(col.fk, row[col.idx]); },
@@ -1416,7 +1491,7 @@ class TableView {
         const cols = this.grid.cols;
         const out = [cols.map((c) => c.name)];
         [...this.grid.picked].sort((a, b) => a - b).forEach((r) => { const row = this.rows.get(r); if (row) out.push(cols.map((c) => row[c.idx])); });
-        copyText(toTSV(out)); toast(`Copied ${plural(out.length - 1, "record")}`);
+        copyMatrix(out); toast(`Copied ${plural(out.length - 1, "record")}`);
       };
       return;
     }
@@ -1659,56 +1734,120 @@ class TableView {
     return k;
   }
 
+  // ---------- row identity
+  //
+  // Writes are addressed by row key, never by row position: a refresh can
+  // move a record to another position, and a key can change (an edited
+  // primary key, or ctid/xmin after any update). `renamed` maps every key a
+  // write replaced to the key the database returned, so later writes and
+  // undo entries that still hold the old key reach the same record.
+
+  noteRename(oldKey, newKey) {
+    const a = JSON.stringify(oldKey), b = JSON.stringify(newKey);
+    if (a === b) return;
+    this.renamed.set(a, newKey);
+    if (this.renamed.size > 5000) this.renamed.delete(this.renamed.keys().next().value);
+  }
+
+  resolveKey(key) {
+    for (let n = 0; n < 10000; n++) {
+      const next = this.renamed.get(JSON.stringify(key));
+      if (!next) break;
+      key = next;
+    }
+    return key;
+  }
+
+  // Position of the loaded row with this key (trying `hint` first), or -1.
+  locate(key, hint) {
+    const want = JSON.stringify(key);
+    const is = (row) => row && JSON.stringify(this.keyOf(row)) === want;
+    if (hint != null && hint >= 0 && is(this.rows.get(hint))) return hint;
+    for (const [p, rows] of this.rows.pages) {
+      for (let i = 0; i < rows.length; i++) if (is(rows[i])) return p * PAGE + i;
+    }
+    return -1;
+  }
+
+  // Replaces the row with key `oldKey` wherever it is now loaded.
+  putRow(oldKey, row, hint, flashCols) {
+    const r = this.locate(oldKey, hint);
+    if (r >= 0) {
+      this.rows.set(r, row);
+      (flashCols || []).forEach((n) => this.grid && this.grid.flash(r, n));
+    }
+    drawerRowChanged(this, oldKey, row);
+    return r;
+  }
+
+  // Runs writes one after another, so responses can never apply out of
+  // order and each write sends the key the previous one returned.
+  serial(fn) {
+    const run = this.writeChain.then(fn, fn);
+    this.writeChain = run.catch(() => {});
+    return run;
+  }
+
   // ---------- writes
   //
   // Every grid write goes through applyChanges: one request, one transaction.
-  // Undo entries hold row keys, not row positions, so they survive a reload.
+  // Each change carries the row as the user saw it; the server refuses the
+  // write if any edited cell no longer has that value (someone else changed it).
 
-  async writeCell(r, name, value) {
-    const row = this.rows.get(r);
-    if (!row) return false;
+  async writeCell(r, name, value, row) {
+    row = row || this.rows.get(r);
+    if (!row) { toast("That row is not loaded yet; nothing was saved", { err: true }); return false; }
     if (row[this.meta.columns.findIndex((c) => c.name === name) + this.offset] === value) return true;
-    return this.applyChanges([{ r, values: { [name]: value } }]);
+    return this.applyChanges([{ r, row, values: { [name]: value } }]);
   }
 
-  // changes: [{ r, values }] for loaded rows; inserts: [values] for new rows.
-  async applyChanges(changes, inserts = [], { label } = {}) {
+  // changes: [{ r, row, values }]: r is a position hint, row the row as seen.
+  // inserts: [values] for new records.
+  applyChanges(changes, inserts = [], opts = {}) {
+    return this.serial(() => this.applyNow(changes, inserts, opts));
+  }
+
+  async applyNow(changes, inserts, { label } = {}) {
     const cols = this.meta.columns;
     const idx = (n) => cols.findIndex((c) => c.name === n) + this.offset;
-    const gen = this.rows.gen;
-    const before = changes.map((ch) => this.rows.get(ch.r));
-    const updates = changes.map((ch, i) => ({ key: this.keyOf(before[i]), values: ch.values }));
-    changes.forEach((ch, i) => {
-      const opt = before[i].slice();
+    const seen = (ch) => Object.fromEntries(Object.keys(ch.values).map((n) => [n, ch.row[idx(n)]]));
+    const keys = changes.map((ch) => this.resolveKey(this.keyOf(ch.row)));
+    const updates = changes.map((ch, i) => ({ key: keys[i], values: ch.values, expect: seen(ch) }));
+    // Show the new values right away; remember what was there to put it back on failure.
+    const shown = changes.map((ch, i) => {
+      const r = this.locate(keys[i], ch.r);
+      if (r < 0) return null;
+      const prev = this.rows.get(r), opt = prev.slice();
       for (const [n, v] of Object.entries(ch.values)) opt[idx(n)] = v;
-      this.rows.set(ch.r, opt);
+      this.rows.set(r, opt);
+      return { prev };
     });
-    if (changes.length) this.grid.draw(true);
+    if (changes.length && this.grid) this.grid.draw(true);
     try {
       const res = await api("batch", { schema: this.meta.schema, name: this.meta.name, updates, inserts, deletes: [] });
-      const undoRows = res.updated.map((row, i) => ({
-        r: changes[i].r,
-        key: this.keyOf(row),
-        old: Object.fromEntries(Object.keys(changes[i].values).map((n) => [n, before[i][idx(n)]])),
-      }));
-      this.pushUndo({ gen, rows: undoRows, created: res.inserted.map((row) => this.keyOf(row)), label });
-      if (gen === this.rows.gen) {
-        res.updated.forEach((row, i) => {
-          const r = changes[i].r;
-          this.rows.set(r, row);
-          Object.keys(changes[i].values).forEach((n) => this.grid.flash(r, n));
-          drawerRowChanged(this, r, row);
-        });
-        this.grid.draw(true);
-      }
+      const undoRows = res.updated.map((row, i) => {
+        const names = Object.keys(changes[i].values);
+        this.noteRename(keys[i], this.keyOf(row));
+        const r = this.putRow(keys[i], row, changes[i].r, names);
+        return { r, key: this.keyOf(row), old: seen(changes[i]), now: Object.fromEntries(names.map((n) => [n, row[idx(n)]])) };
+      });
+      this.pushUndo({ rows: undoRows, created: res.inserted.map((row) => this.keyOf(row)), label });
+      if (this.grid) this.grid.draw(true);
       if (res.inserted.length) this.refresh(true);
       return true;
     } catch (e) {
-      if (gen === this.rows.gen) {
-        changes.forEach((ch, i) => this.rows.set(ch.r, before[i]));
+      changes.forEach((ch, i) => {
+        if (!shown[i]) return;
+        const r = this.locate(keys[i], ch.r);
+        if (r >= 0) this.rows.set(r, shown[i].prev);
+      });
+      if (this.grid) {
         this.grid.draw(true);
         const bad = changes[e.index ?? 0];
-        if (bad && (e.index == null || e.index < changes.length)) this.grid.markErr(bad.r, Object.keys(bad.values)[0]);
+        if (bad && (e.index == null || e.index < changes.length)) {
+          const r = this.locate(keys[e.index ?? 0], bad.r);
+          if (r >= 0) this.grid.markErr(r, Object.keys(bad.values)[0]);
+        }
       }
       if (changes.length + inserts.length > 1) e.detail = [e.detail, "Nothing was saved: a batch is saved completely or not at all."].filter(Boolean).join("  ");
       toastErr(e);
@@ -1721,45 +1860,60 @@ class TableView {
     if (this.undo.length > 200) this.undo.shift();
   }
 
-  // Undo entries: { gen, rows: [{ r, key, old }], created: [key], label }.
+  // Undo entries: { rows: [{ r, key, old, now }], created: [key], label }.
   // Reverting cells and removing added records happen in one transaction.
-  async undoLast() {
+  // Undo only applies if the cells still hold what this change wrote, so it
+  // never reverts someone else's later edit.
+  undoLast() {
+    return this.serial(() => this.undoNow());
+  }
+
+  async undoNow() {
     const u = this.undo.pop();
     if (!u) { toast("Nothing to undo"); return; }
-    const rows = u.rows || [], created = u.created || [];
+    const rows = u.rows || [];
+    const keys = rows.map((x) => this.resolveKey(x.key));
+    const created = (u.created || []).map((k) => this.resolveKey(k));
     try {
-      const res = await api("batch", { schema: this.meta.schema, name: this.meta.name, updates: rows.map((x) => ({ key: x.key, values: x.old })), inserts: [], deletes: created });
-      if (u.gen === this.rows.gen && !created.length) {
-        res.updated.forEach((row, i) => {
-          const x = rows[i];
-          this.rows.set(x.r, row);
-          Object.keys(x.old).forEach((n) => this.grid.flash(x.r, n));
-          drawerRowChanged(this, x.r, row);
-        });
-        this.grid.draw(true);
-      } else this.refresh(true);
+      const res = await api("batch", { schema: this.meta.schema, name: this.meta.name, updates: rows.map((x, i) => ({ key: keys[i], values: x.old, expect: x.now })), inserts: [], deletes: created });
+      res.updated.forEach((row, i) => {
+        this.noteRename(keys[i], this.keyOf(row));
+        this.putRow(keys[i], row, rows[i].r, Object.keys(rows[i].old));
+      });
+      if (created.length) this.refresh(true);
+      else if (this.grid) this.grid.draw(true);
       const cells = rows.reduce((a, x) => a + Object.keys(x.old).length, 0);
       const what = [cells && (cells === 1 && !created.length ? `change to ${Object.keys(rows[0].old)[0]}` : plural(cells, "cell")), created.length && `removed ${plural(created.length, "added record")}`].filter(Boolean).join(", ");
       toast(`Undid ${u.label ? u.label + ": " : ""}${what}`);
     } catch (e) {
-      e.detail = [e.detail, "Undo needs the rows as they were; refresh if they were changed or deleted meanwhile."].filter(Boolean).join("  ");
+      e.detail = [e.detail, "Undo needs the rows as this change left them; they were changed or deleted since. Nothing was undone."].filter(Boolean).join("  ");
       toastErr(e);
     }
   }
 
-  // Groups [r, name, value] jobs into one change per row.
-  static byRow(jobs) {
+  // Groups [r, name, value] jobs into one change per row, with the row as seen now.
+  byRow(jobs) {
     const m = new Map();
     for (const [r, n, v] of jobs) { if (!m.has(r)) m.set(r, {}); m.get(r)[n] = v; }
-    return [...m].map(([r, values]) => ({ r, values }));
+    return [...m].map(([r, values]) => ({ r, row: this.rows.get(r), values }));
+  }
+
+  // Loads every row of a range before acting on it, so nothing is skipped
+  // silently because it was not on screen yet.
+  async loadRows(r0, r1, what) {
+    if (await this.rows.loadRange(r0, r1)) return true;
+    toast(`Could not load all the rows to ${what}; nothing was changed`, { err: true });
+    return false;
   }
 
   async clearCells(s) {
+    if (s.r1 - s.r0 + 1 > 2000) { toast("Clear up to 2,000 rows at a time"); return; }
+    if (!(await this.loadRows(s.r0, s.r1, "clear"))) return;
     const cols = this.grid.cols;
     const jobs = [];
     for (let r = s.r0; r <= s.r1; r++) {
       const row = this.rows.get(r);
-      if (!row) continue;
+      if (!row) continue; // past the last record
       for (let c = s.c0; c <= s.c1; c++) {
         const col = cols[c];
         if (col.readonly || row[col.idx] === null) continue;
@@ -1769,8 +1923,9 @@ class TableView {
     }
     if (!jobs.length) { toast("Nothing to clear: the selected fields are empty, read-only or required"); return; }
     if (jobs.length > 2000) { toast("Clear up to 2,000 cells at a time"); return; }
+    const changes = this.byRow(jobs); // rows as seen when the user decided
     if (jobs.length > 1 && !(await dialog({ title: `Clear ${plural(jobs.length, "cell")}?`, body: "Each cell is set to null, or to empty text where null is not allowed. Ctrl/⌘+Z undoes it.", ok: "Clear cells" }))) return;
-    if (await this.applyChanges(TableView.byRow(jobs), [], { label: "clear" }) && jobs.length > 1) toast(`Cleared ${plural(jobs.length, "cell")}`);
+    if (await this.applyChanges(changes, [], { label: "clear" }) && jobs.length > 1) toast(`Cleared ${plural(jobs.length, "cell")}`);
   }
 
   async paste(s, matrix) {
@@ -1779,24 +1934,28 @@ class TableView {
     const single = matrix.length === 1 && matrix[0].length === 1;
     const rows = single ? s.r1 - s.r0 + 1 : matrix.length;
     const width = single ? s.c1 - s.c0 + 1 : Math.max(...matrix.map((r) => r.length));
+    if (rows > 2000) { toast("Paste up to 2,000 rows at a time"); return; }
+    if (!(await this.loadRows(s.r0, s.r0 + rows - 1, "paste into"))) return;
     const n = this.rows.count();
     // Rows that fall past the last record become new records, but only when
     // the end of the table is known, i.e. the count is exact.
     const canAdd = this.editable && this.rows.exact && !single;
     const value = (col, raw) => {
       let v = raw;
+      if (v === null) return col.nullable === false && col.kind === "text" ? "" : null; // a NULL copied from a grid
       if (v === "" && col.kind !== "text") v = null;
       if (col.kind === "bool" && v != null) v = /^(t|true|yes|y|1|on|x|✓|checked)$/i.test(v.trim()) ? "true" : "false";
       return v;
     };
+    let dropped = 0;
     for (let i = 0; i < rows; i++) {
       const r = s.r0 + i;
-      if (r >= n) {
-        if (!canAdd) break;
+      if (r >= n || (this.rows.exact && !this.rows.get(r))) {
+        if (!canAdd) { dropped++; continue; }
         const values = {};
         for (let j = 0; j < width && s.c0 + j < cols.length; j++) {
           const col = cols[s.c0 + j];
-          const raw = matrix[i][j] ?? "";
+          const raw = (matrix[i][j] === undefined ? "" : matrix[i][j]);
           // Empty cells are left out so the column default applies.
           if (col.readonly || raw === "") continue;
           values[col.name] = value(col, raw);
@@ -1804,21 +1963,23 @@ class TableView {
         inserts.push(values);
         continue;
       }
-      if (!this.rows.get(r)) continue;
+      if (!this.rows.get(r)) { toast("Could not load all the rows to paste into; nothing was changed", { err: true }); return; }
       for (let j = 0; j < width && s.c0 + j < cols.length; j++) {
         const col = cols[s.c0 + j];
         if (col.readonly) continue;
-        jobs.push([r, col.name, value(col, single ? matrix[0][0] : (matrix[i][j] ?? ""))]);
+        jobs.push([r, col.name, value(col, single ? matrix[0][0] : ((matrix[i][j] === undefined ? "" : matrix[i][j])))]);
       }
     }
-    if (!jobs.length && !inserts.length) { toast("Nothing to paste into: the selected fields are read-only"); return; }
+    if (!jobs.length && !inserts.length) { toast(dropped ? "Nothing to paste: the rows are past the end of the table" : "Nothing to paste into: the selected fields are read-only"); return; }
     if (jobs.length > 2000 || inserts.length > 2000) { toast("Paste up to 2,000 cells at a time"); return; }
-    if (inserts.length || jobs.length > 20) {
+    const changes = this.byRow(jobs);
+    if (inserts.length || jobs.length > 20 || dropped) {
       const parts = [jobs.length && `updates ${plural(jobs.length, "cell")}`, inserts.length && `adds ${plural(inserts.length, "new record")}`].filter(Boolean).join(" and ");
-      const ok = await dialog({ title: inserts.length ? `Add ${plural(inserts.length, "record")}?` : `Paste into ${plural(jobs.length, "cell")}?`, body: `This paste ${parts}, in one transaction. Ctrl/⌘+Z undoes it.`, ok: "Paste", danger: false });
+      const skip = dropped ? ` ${plural(dropped, "pasted row")} past the end of the table will be left out, because new records cannot be added here.` : "";
+      const ok = await dialog({ title: inserts.length ? `Add ${plural(inserts.length, "record")}?` : `Paste into ${plural(jobs.length, "cell")}?`, body: `This paste ${parts}, in one transaction.${skip} Ctrl/⌘+Z undoes it.`, ok: "Paste", danger: false });
       if (!ok) return;
     }
-    if (await this.applyChanges(TableView.byRow(jobs), inserts, { label: "paste" }) && jobs.length + inserts.length > 1) {
+    if (await this.applyChanges(changes, inserts, { label: "paste" }) && jobs.length + inserts.length > 1) {
       toast([jobs.length && `Pasted ${plural(jobs.length, "cell")}`, inserts.length && `added ${plural(inserts.length, "record")}`].filter(Boolean).join(", "));
     }
   }
@@ -1833,9 +1994,17 @@ class TableView {
     return out;
   }
 
+  // Keys of the rows at these positions, loading them first.
+  async keysAt(list, what) {
+    if (!list.length) return [];
+    if (list.length > 2000) { toast(`${what[0].toUpperCase() + what.slice(1)} up to 2,000 records at a time`); return null; }
+    if (!(await this.loadRows(list[0], list[list.length - 1], what))) return null;
+    return list.map((r) => this.rows.get(r)).filter(Boolean).map((row) => this.resolveKey(this.keyOf(row)));
+  }
+
   async deleteRows(list) {
-    const keys = list.map((r) => this.rows.get(r)).filter(Boolean).map((row) => this.keyOf(row));
-    if (!keys.length) return;
+    const keys = await this.keysAt(list, "delete");
+    if (!keys || !keys.length) return;
     const ok = await dialog({ title: `Delete ${plural(keys.length, "record")}?`, body: `This removes them from ${this.meta.schema}.${this.meta.name} in one transaction. It cannot be undone.`, ok: `Delete ${plural(keys.length, "record")}` });
     if (!ok) return;
     try {
@@ -1846,8 +2015,8 @@ class TableView {
   }
 
   async duplicateRows(list) {
-    const keys = list.map((r) => this.rows.get(r)).filter(Boolean).map((row) => this.keyOf(row));
-    if (!keys.length) return;
+    const keys = await this.keysAt(list, "duplicate");
+    if (!keys || !keys.length) return;
     if (keys.length > 1000) { toast("Duplicate up to 1,000 records at a time"); return; }
     if (keys.length > 20 && !(await dialog({ title: `Duplicate ${plural(keys.length, "record")}?`, body: `Each copy is added to ${this.meta.schema}.${this.meta.name} in one transaction. Ctrl/⌘+Z undoes it.`, ok: "Duplicate", danger: false }))) return;
     try {
@@ -1986,10 +2155,15 @@ async function closeDrawer(force) {
   return true;
 }
 
-function drawerRowChanged(view, r, row) {
+// A grid write replaced the record with key oldKey: keep an open drawer on
+// it current. With unsaved edits the drawer keeps what the user saw, so
+// saving still detects the conflict.
+function drawerRowChanged(view, oldKey, row) {
   if (!drawer) return;
   const top = drawer.stack[drawer.stack.length - 1];
-  if (top.view === view && top.r === r && !drawer.dirty()) { top.row = row; drawer.render(); }
+  if (top.view !== view || top.isNew || !top.row) return;
+  if (JSON.stringify(keyFor(top.meta, top.row)) !== JSON.stringify(oldKey)) return;
+  if (!drawer.dirty()) { top.row = row; drawer.render(); }
 }
 
 async function openRecord(entry) {
@@ -2041,7 +2215,7 @@ function renderRecord() {
     const selfFill = !!copy && !!(c.identity || c.generated || (c.pk && c.default));
     const ro = !editable || c.generated === "s" || (c.identity === "a") || kind === "blob" || (blank && (c.identity || c.generated)) || selfFill;
     const f = { c, kind, orig, val: orig === undefined ? null : orig, touched: false, ro, selfFill, copied: !!copy };
-    if (kind === "json" && orig != null) { try { f.pretty = JSON.stringify(JSON.parse(orig), null, 2); f.val = f.pretty; } catch {} }
+    if (kind === "json" && orig != null) { const p = prettyJSON(orig); if (p != null) { f.pretty = p; f.val = p; } }
     f.changed = () => blank ? f.touched : f.val !== (f.pretty ?? f.orig);
     return f;
   });
@@ -2124,7 +2298,9 @@ function renderRecord() {
   $("[data-back]", el) && ($("[data-back]", el).onclick = popRecord);
   const step = async (d) => {
     if (!(await okToDiscard())) return;
-    const r = e.r + d;
+    const at = e.view.locate(e.view.resolveKey(keyFor(meta, e.row)), e.r);
+    if (at < 0) return;
+    const r = at + d;
     const nr = e.view.rows.get(r);
     if (r < 0 || !nr) return;
     e.r = r; e.row = nr;
@@ -2144,7 +2320,7 @@ function renderRecord() {
   if (del) del.onclick = async () => {
     if (!(await dialog({ title: "Delete this record?", body: `It is removed from ${meta.schema}.${meta.name} right away. This cannot be undone.`, ok: "Delete record" }))) return;
     try {
-      await api("delete", { schema: meta.schema, name: meta.name, keys: [keyFor(meta, row)] });
+      await api("delete", { schema: meta.schema, name: meta.name, keys: [e.view ? e.view.resolveKey(keyFor(meta, row)) : keyFor(meta, row)] });
       toast("Deleted 1 record");
       const v = e.view;
       closeDrawer(true);
@@ -2210,12 +2386,13 @@ async function saveRecord() {
   if (!drawer) return;
   const e = drawer.stack[drawer.stack.length - 1];
   const { meta, isNew } = e;
-  const values = {};
+  const values = {}, expect = {};
   for (const f of drawer.fields) {
     if (!f.changed()) continue;
     let v = f.val;
     if (v === "" && !["text", "json"].includes(f.kind) && f.c.nullable) v = null;
     values[f.c.name] = v;
+    if (!isNew) expect[f.c.name] = f.orig;
   }
   if (!isNew && !Object.keys(values).length) return;
   const btn = $("[data-save]", drawer.el);
@@ -2224,7 +2401,7 @@ async function saveRecord() {
     if (isNew) {
       // A copy sends only the fields you changed; the server copies the rest, binary data included.
       const res = e.copyOf
-        ? { row: (await api("duplicate", { schema: meta.schema, name: meta.name, keys: [e.copyOf.key], values })).rows[0] }
+        ? { row: (await api("duplicate", { schema: meta.schema, name: meta.name, keys: [e.view ? e.view.resolveKey(e.copyOf.key) : e.copyOf.key], values })).rows[0] }
         : await api("insert", { schema: meta.schema, name: meta.name, values });
       toast(e.copyOf ? "Copy created" : "Record created");
       if (e.view && e.view.grid) e.view.pushUndo({ created: [keyFor(meta, res.row)], label: e.copyOf ? "duplicate" : "add" });
@@ -2232,13 +2409,23 @@ async function saveRecord() {
       if (e.view && e.view.grid) e.view.refresh(true);
       renderRecord();
     } else {
-      const res = await api("update", { schema: meta.schema, name: meta.name, key: keyFor(meta, e.row), values });
+      const v = e.view;
+      const send = () => {
+        const key = v ? v.resolveKey(keyFor(meta, e.row)) : keyFor(meta, e.row);
+        return api("update", { schema: meta.schema, name: meta.name, key, values, expect }).then((res) => ({ key, res }));
+      };
+      // Through the view's write queue, so it is ordered with grid edits.
+      const { key, res } = v ? await v.serial(send) : await send();
       toast("Changes saved");
       e.row = res.row;
-      if (e.view && e.r != null) {
-        e.view.rows.set(e.r, res.row);
-        Object.keys(values).forEach((n) => e.view.grid.flash(e.r, n));
-        e.view.grid.draw(true);
+      if (v) {
+        v.noteRename(key, keyFor(meta, res.row));
+        const r = v.locate(key, e.r);
+        if (r >= 0) {
+          v.rows.set(r, res.row);
+          e.r = r;
+          if (v.grid) { Object.keys(values).forEach((n) => v.grid.flash(r, n)); v.grid.draw(true); }
+        }
       }
       renderRecord();
     }
@@ -2490,7 +2677,7 @@ function palette() {
     ...THEME_ORDER.filter((t) => t !== themePref()).map((t) => ({ label: t === "system" ? "Theme: follow the system" : `Theme: ${t}`, icon: THEMES[t].icon, run: () => setTheme(t) })),
     { label: "Reload table list", icon: "i-refresh", run: async () => { await loadTables(); paintTables(); toast("Table list reloaded"); } },
     ...S.meta.databases.filter((d) => d !== S.meta.database).map((d) => ({ label: `Switch to database ${d}`, icon: "i-db", run: () => switchDB(d) })),
-    ...(S.meta.fixed ? [] : [{ label: "Sign out", icon: "i-logout", run: async () => { try { await api("logout"); } catch {} signedOut(); } }]),
+    ...(S.meta.fixed ? [] : [{ label: "Sign out", icon: "i-logout", run: signOut }]),
   ];
   let items = [], hi = 0;
   const close = () => { scrim.remove(); el.remove(); };
@@ -2530,6 +2717,10 @@ function palette() {
 addEventListener("keydown", (e) => {
   if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); palette(); }
 });
+
+// Browser tests (e2e/grid.mjs) set window.__AA_E2E before this script runs
+// to reach internals; a normal page never has it.
+if (E2E) E2E.app = { S, api, prettyJSON, pastedMatrix, saveRecord, closeDrawer, get drawer() { return drawer; }, get lastCopy() { return lastCopy; } };
 
 boot();
 })();

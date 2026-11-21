@@ -558,6 +558,7 @@ type editReq struct {
 	Key    rowKey             `json:"key"`
 	Keys   []rowKey           `json:"keys"`
 	Values map[string]*string `json:"values"`
+	Expect map[string]*string `json:"expect"`
 }
 
 func (a *App) editable(db *DB, ctx context.Context, ref tableRef) (*TableMeta, error) {
@@ -573,7 +574,11 @@ type stmt struct {
 	args [][]byte
 }
 
-func updateSQL(m *TableMeta, key rowKey, values map[string]*string) (stmt, error) {
+// updateSQL builds an UPDATE of one row. expect holds, per column, the value
+// the user saw (PostgreSQL text format). Each is compared with the column's
+// current text, so a cell someone else changed meanwhile makes the update
+// match no row and fail instead of silently overwriting their change.
+func updateSQL(m *TableMeta, key rowKey, values, expect map[string]*string) (stmt, error) {
 	if len(values) == 0 {
 		return stmt{}, errors.New("nothing to update")
 	}
@@ -590,6 +595,24 @@ func updateSQL(m *TableMeta, key rowKey, values map[string]*string) (stmt, error
 	where, err := keyWhere(m, key, args)
 	if err != nil {
 		return stmt{}, err
+	}
+	for _, c := range m.Columns {
+		v, ok := expect[c.Name]
+		if !ok || c.Udt == "bytea" { // the grid only sees a byte count for bytea
+			continue
+		}
+		// format('%s') renders with the type's output function, exactly the
+		// text the browser got. A ::text cast differs for bool, inet, char(n).
+		if v == nil {
+			where += " AND " + ident(c.Name) + " IS NULL"
+		} else {
+			where += " AND " + ident(c.Name) + " IS NOT NULL AND format('%s', " + ident(c.Name) + ") = " + args.add(v)
+		}
+	}
+	for name := range expect {
+		if m.column(name) == nil {
+			return stmt{}, errors.New("unknown column in update")
+		}
 	}
 	return stmt{"UPDATE " + ident(m.Schema, m.Name) + " SET " + strings.Join(sets, ", ") + " WHERE " + where + " RETURNING " + selectList(m, false), args.vals}, nil
 }
@@ -625,7 +648,7 @@ func (a *App) handleUpdate(s *Session, db *DB, w http.ResponseWriter, r *http.Re
 	if err != nil {
 		return nil, err
 	}
-	st, err := updateSQL(m, req.Key, req.Values)
+	st, err := updateSQL(m, req.Key, req.Values, req.Expect)
 	if err != nil {
 		return nil, err
 	}
@@ -654,6 +677,7 @@ type batchReq struct {
 	Updates []struct {
 		Key    rowKey             `json:"key"`
 		Values map[string]*string `json:"values"`
+		Expect map[string]*string `json:"expect"`
 	} `json:"updates"`
 	Inserts []map[string]*string `json:"inserts"`
 	Deletes []rowKey             `json:"deletes"`
@@ -683,7 +707,7 @@ func (a *App) handleBatch(s *Session, db *DB, w http.ResponseWriter, r *http.Req
 	}
 	stmts := make([]stmt, 0, n)
 	for _, u := range req.Updates {
-		st, err := updateSQL(m, u.Key, u.Values)
+		st, err := updateSQL(m, u.Key, u.Values, u.Expect)
 		if err != nil {
 			return nil, err
 		}
@@ -739,7 +763,7 @@ func (db *DB) writeMany(ctx context.Context, stmts []stmt) ([][]any, error) {
 		}
 		if n := res.CommandTag.RowsAffected(); n != 1 {
 			if n == 0 {
-				return rollback(errors.New("the row no longer exists or was changed by someone else; refresh and try again"))
+				return rollback(errors.New("the record was changed or deleted by someone else since you loaded it; nothing was saved. Refresh to see the current values"))
 			}
 			return rollback(fmt.Errorf("refusing to change %d rows at once", n))
 		}
@@ -781,6 +805,9 @@ func (a *App) handleDelete(s *Session, db *DB, w http.ResponseWriter, r *http.Re
 	}
 	if len(req.Keys) == 0 {
 		return nil, errors.New("no rows selected")
+	}
+	if len(req.Keys) > maxBatch {
+		return nil, fmt.Errorf("delete up to %d records at a time", maxBatch)
 	}
 	conn, err := db.pool.Acquire(ctx)
 	if err != nil {

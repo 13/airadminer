@@ -41,5 +41,9 @@ jobs:
         run: go test -race -count=1 ./...
       - name: js syntax
         run: node --check web/app.js && node --check web/theme.js
+      - name: browser tests (headless Chrome)
+        run: make e2e
+        env:
+          CHROME: google-chrome
       - name: build all platforms
         run: make dist

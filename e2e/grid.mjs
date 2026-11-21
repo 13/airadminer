@@ -1,0 +1,253 @@
+// End-to-end tests of the grid's write paths in headless Chrome, driven over
+// the DevTools protocol (no npm packages needed).
+//
+//   make e2e      # builds, starts airadminer with -dsn, runs this file
+//
+// Environment: AIRADMINER_URL (server), CHROME (browser binary).
+// Every test works in its own schema and drops it afterwards.
+
+import { spawn } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+const BASE = process.env.AIRADMINER_URL || "http://127.0.0.1:18090/";
+const CHROME = process.env.CHROME || "google-chrome";
+const PORT = 9300 + Math.floor(Math.random() * 500);
+
+const profile = mkdtempSync(join(tmpdir(), "aa-e2e-"));
+const chrome = spawn(CHROME, ["--headless=new", `--remote-debugging-port=${PORT}`, `--user-data-dir=${profile}`, "--no-first-run", "--no-default-browser-check", "--disable-gpu", "about:blank"], { stdio: "ignore" });
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+let ws, seq = 0;
+const waiting = new Map();
+const pageErrors = [];
+
+async function connect() {
+  for (let i = 0; i < 100; i++) {
+    try {
+      const list = await (await fetch(`http://127.0.0.1:${PORT}/json/list`)).json();
+      const page = list.find((t) => t.type === "page");
+      if (page) {
+        ws = new WebSocket(page.webSocketDebuggerUrl);
+        await new Promise((ok, bad) => { ws.onopen = ok; ws.onerror = bad; });
+        ws.onmessage = (m) => {
+          const msg = JSON.parse(m.data);
+          if (msg.id && waiting.has(msg.id)) { waiting.get(msg.id)(msg); waiting.delete(msg.id); }
+          if (msg.method === "Runtime.exceptionThrown") pageErrors.push(msg.params.exceptionDetails.exception?.description || msg.params.exceptionDetails.text);
+        };
+        return;
+      }
+    } catch {}
+    await sleep(100);
+  }
+  throw new Error("Chrome did not start");
+}
+
+function send(method, params = {}) {
+  const id = ++seq;
+  ws.send(JSON.stringify({ id, method, params }));
+  return new Promise((ok) => waiting.set(id, ok));
+}
+
+// Runs an async function body in the page and returns its JSON result.
+async function run(body) {
+  const res = await send("Runtime.evaluate", { expression: `(async () => { ${body} })()`, awaitPromise: true, returnByValue: true });
+  if (res.result.exceptionDetails) throw new Error(res.result.exceptionDetails.exception?.description || res.result.exceptionDetails.text);
+  return res.result.result.value;
+}
+
+const helpers = `
+  const A = __AA_E2E.app;
+  window.S = A.S; window.api = A.api; window.prettyJSON = A.prettyJSON; window.pastedMatrix = A.pastedMatrix;
+  window.saveRecord = A.saveRecord; window.closeDrawer = A.closeDrawer;
+  Object.defineProperty(window, "drawer", { get: () => A.drawer });
+  Object.defineProperty(window, "lastCopy", { get: () => A.lastCopy });
+  window.sql = async (q) => { const r = await api("query", { sql: q }); if (r.error) throw new Error(r.error.error); return r.results.at(-1)?.rows || []; };
+  window.until = async (fn, what) => { for (let i = 0; i < 200; i++) { try { if (await fn()) return; } catch {} await new Promise((r) => setTimeout(r, 25)); } throw new Error("timed out waiting for " + what); };
+  window.open_ = async (schema, name) => {
+    location.hash = "#/t/" + schema + "/" + name;
+    await until(() => S.view && S.view.meta && S.view.meta.name === name && S.view.rows.ready, "table " + name);
+  };
+  window.col = (n) => S.view.grid.cols.findIndex((c) => c.name === n);
+  __AA_E2E.confirm = true;   // confirm every dialog
+  return true;
+`;
+
+const tests = {
+  async "paste reaches rows that were not loaded yet"(sc) {
+    return run(`
+      await sql("CREATE TABLE ${sc}.items (id int PRIMARY KEY, v text); INSERT INTO ${sc}.items SELECT g, 'orig' FROM generate_series(1, 1000) g");
+      await open_("${sc}", "items");
+      const c = col("v");
+      await S.view.paste({ r0: 0, r1: 0, c0: c, c1: c }, Array.from({ length: 700 }, (_, i) => ["p" + i]));
+      const [[n]] = await sql("SELECT count(*) FROM ${sc}.items WHERE v = 'p' || (id - 1)");
+      if (n !== "700") throw new Error("pasted rows saved: " + n + " of 700");
+    `);
+  },
+
+  async "an edit lands on its record after the rows moved"(sc) {
+    return run(`
+      await sql("CREATE TABLE ${sc}.items (id int PRIMARY KEY, v text); INSERT INTO ${sc}.items SELECT g, 'orig' FROM generate_series(1, 50) g");
+      await open_("${sc}", "items");
+      const row = S.view.rows.get(5);                  // id 6, as the editor saw it
+      S.view.settings.sort = [{ col: "id", desc: true }];
+      S.view.refresh(true);
+      await until(() => S.view.rows.get(5) && S.view.rows.get(5)[0] === "45", "resorted rows");
+      if (!(await S.view.writeCell(5, "v", "moved", row))) throw new Error("write failed");
+      const rows = await sql("SELECT id FROM ${sc}.items WHERE v = 'moved'");
+      if (rows.length !== 1 || rows[0][0] !== "6") throw new Error("edited ids: " + JSON.stringify(rows));
+      const shown = S.view.rows.get(S.view.locate({ id: "6" }));
+      if (shown[1] !== "moved") throw new Error("grid shows " + shown[1] + " for id 6");
+      if (S.view.rows.get(5)[1] !== "orig") throw new Error("the row now at position 5 was repainted");
+    `);
+  },
+
+  async "quick edits to one row of a table without a primary key all save"(sc) {
+    return run(`
+      await sql("CREATE TABLE ${sc}.nopk (v text, w text); INSERT INTO ${sc}.nopk VALUES ('a0', 'b0')");
+      await open_("${sc}", "nopk");
+      const row = S.view.rows.get(0);
+      const ok = await Promise.all([S.view.writeCell(0, "v", "a1", row), S.view.writeCell(0, "w", "b1", row)]);
+      if (!ok.every(Boolean)) throw new Error("a write failed: " + document.querySelector(".toast")?.textContent);
+      const ok2 = await S.view.writeCell(0, "v", "a2");  // uses the key the last write returned
+      const [[v, w]] = await sql("SELECT v, w FROM ${sc}.nopk");
+      if (!ok2 || v !== "a2" || w !== "b1") throw new Error("database has " + v + ", " + w);
+      await S.view.undoLast();
+      const [[v2]] = await sql("SELECT v FROM ${sc}.nopk");
+      if (v2 !== "a1") throw new Error("undo on a ctid table: " + v2);
+    `);
+  },
+
+  async "an edit based on a stale value does not overwrite someone else's change"(sc) {
+    return run(`
+      await sql("CREATE TABLE ${sc}.items (id int PRIMARY KEY, v text); INSERT INTO ${sc}.items VALUES (1, 'orig')");
+      await open_("${sc}", "items");
+      const row = S.view.rows.get(0);
+      await sql("UPDATE ${sc}.items SET v = 'theirs'");
+      if (await S.view.writeCell(0, "v", "mine", row)) throw new Error("stale write succeeded");
+      const [[v]] = await sql("SELECT v FROM ${sc}.items");
+      if (v !== "theirs") throw new Error("database has " + v);
+      if (S.view.rows.get(0)[1] !== "orig") throw new Error("failed write left an optimistic value");
+    `);
+  },
+
+  async "undo does not revert a later change by someone else"(sc) {
+    return run(`
+      await sql("CREATE TABLE ${sc}.items (id int PRIMARY KEY, v text); INSERT INTO ${sc}.items VALUES (1, 'orig')");
+      await open_("${sc}", "items");
+      await S.view.writeCell(0, "v", "mine");
+      await sql("UPDATE ${sc}.items SET v = 'theirs'");
+      await S.view.undoLast();
+      const [[v]] = await sql("SELECT v FROM ${sc}.items");
+      if (v !== "theirs") throw new Error("undo overwrote: " + v);
+    `);
+  },
+
+  async "copy and paste inside the grid keeps NULL"(sc) {
+    return run(`
+      await sql("CREATE TABLE ${sc}.items (id int PRIMARY KEY, t text); INSERT INTO ${sc}.items VALUES (1, NULL), (2, 'x'), (3, 'a'), (4, 'b')");
+      await open_("${sc}", "items");
+      const c = col("t");
+      S.view.grid.sel = { r: 0, c, r2: 1, c2: c };
+      S.view.grid.copy();
+      await S.view.paste({ r0: 2, r1: 2, c0: c, c1: c }, pastedMatrix(lastCopy.text));
+      const rows = await sql("SELECT id, t IS NULL, t FROM ${sc}.items WHERE id IN (3, 4) ORDER BY id");
+      if (JSON.stringify(rows) !== JSON.stringify([["3", "t", null], ["4", "f", "x"]])) throw new Error(JSON.stringify(rows));
+    `);
+  },
+
+  async "in-cell editor, checkbox and enum picker save to the database"(sc) {
+    return run(`
+      await sql("CREATE TYPE ${sc}.mood AS ENUM ('ok', 'sad'); CREATE TABLE ${sc}.items (id int PRIMARY KEY, v text, b bool, m ${sc}.mood); INSERT INTO ${sc}.items VALUES (1, 'a', false, 'ok')");
+      await open_("${sc}", "items");
+      const g = S.view.grid;
+      g.select(0, col("v"));
+      g.startEdit("typed");
+      g.commitEdit();
+      await until(async () => (await sql("SELECT v FROM ${sc}.items"))[0][0] === "typed", "text edit saved");
+      await new Promise((r) => setTimeout(r, 300)); await S.view.writeChain;
+      if (document.querySelector(".toast.err")) throw new Error("after text: " + document.querySelector(".toast.err").textContent);
+      g.select(0, col("b"));
+      g.startEdit();                                    // Enter on a checkbox toggles it
+      await until(async () => (await sql("SELECT b FROM ${sc}.items"))[0][0] === "t", "checkbox saved");
+      await new Promise((r) => setTimeout(r, 300)); await S.view.writeChain;
+      if (document.querySelector(".toast.err")) throw new Error("after bool: " + document.querySelector(".toast.err").textContent);
+      g.select(0, col("m"));
+      g.startEdit();
+      await until(() => document.querySelector(".pop [data-i]"), "enum picker");
+      [...document.querySelectorAll(".pop [data-i]")].find((b) => b.textContent.includes("sad")).click();
+      await until(async () => (await sql("SELECT m FROM ${sc}.items"))[0][0] === "sad", "enum saved");
+      await S.view.writeChain;
+      if (document.querySelector(".toast.err")) throw new Error(document.querySelector(".toast.err").textContent);
+    `);
+  },
+
+  async "JSON is formatted without changing numbers"() {
+    return run(`
+      const src = '{"a":12345678901234567890,"b":[1.10,{},[]],"s":"x\\\\"y, {z}: 1"}';
+      const p = prettyJSON(src);
+      if (!p.includes("12345678901234567890") || !p.includes("1.10") || !p.includes('"x\\\\"y, {z}: 1"')) throw new Error(p);
+      if (p.replace(/\\s+/g, "") !== src.replace(/\\s+/g, "").replace(/\\s/g, "")) {
+        // whitespace inside the string must survive; compare structurally instead
+        if (JSON.stringify(JSON.parse(p)) !== JSON.stringify(JSON.parse(src))) throw new Error("changed: " + p);
+      }
+      if (prettyJSON("{bad") !== null) throw new Error("invalid JSON must not be formatted");
+    `);
+  },
+
+  async "saving the record form after the grid moved updates the right record"(sc) {
+    return run(`
+      await sql("CREATE TABLE ${sc}.items (id int PRIMARY KEY, v text, j jsonb); INSERT INTO ${sc}.items SELECT g, 'orig', '{\\"n\\": 12345678901234567890}' FROM generate_series(1, 30) g");
+      await open_("${sc}", "items");
+      S.view.expand(9);                                 // id 10
+      await until(() => drawer && drawer.fields, "record form");
+      S.view.settings.sort = [{ col: "id", desc: true }];
+      S.view.refresh(true);
+      await until(() => S.view.rows.get(9) && S.view.rows.get(9)[0] === "21", "resorted rows");
+      drawer.fields.find((f) => f.c.name === "v").val = "from form";
+      await saveRecord();
+      const rows = await sql("SELECT id, j::text FROM ${sc}.items WHERE v = 'from form'");
+      if (rows.length !== 1 || rows[0][0] !== "10") throw new Error("saved into " + JSON.stringify(rows));
+      if (!rows[0][1].includes("12345678901234567890")) throw new Error("JSON changed: " + rows[0][1]);
+      if (S.view.rows.get(9)[1] !== "orig") throw new Error("the row now at position 9 was repainted");
+      await closeDrawer(true);
+    `);
+  },
+};
+
+let failed = 0;
+try {
+  await connect();
+  await send("Runtime.enable");
+  await send("Page.enable");
+  await send("Page.addScriptToEvaluateOnNewDocument", { source: "window.__AA_E2E = {}" });
+  await send("Page.navigate", { url: BASE });
+  for (let i = 0; i < 200; i++) {
+    try { if (await run("return !!(window.__AA_E2E && __AA_E2E.app && __AA_E2E.app.S.meta)")) break; } catch {}
+    await sleep(50);
+  }
+  await run(helpers);
+  for (const [name, fn] of Object.entries(tests)) {
+    const sc = "e2e_" + Math.random().toString(36).slice(2, 8);
+    try {
+      await run(`document.querySelectorAll(".toast").forEach((t) => t.remove()); await sql("CREATE SCHEMA ${sc}"); return true;`);
+      await fn(sc);
+      console.log("ok   " + name);
+    } catch (e) {
+      failed++;
+      console.log("FAIL " + name + "\n     " + String(e.message || e).split("\n")[0]);
+    } finally {
+      await run(`try { await closeDrawer(true); } catch {} location.hash = ""; await sql("DROP SCHEMA IF EXISTS ${sc} CASCADE"); return true;`).catch(() => {});
+    }
+  }
+  const errs = pageErrors.filter((e) => !/clipboard|Clipboard|Document is not focused/.test(e));
+  if (errs.length) { failed++; console.log("FAIL uncaught page errors:\n     " + errs.join("\n     ")); }
+} finally {
+  try { ws && ws.close(); } catch {}
+  chrome.kill();
+  await sleep(200);
+  rmSync(profile, { recursive: true, force: true });
+}
+console.log(failed ? `${failed} failed` : "all passed");
+process.exit(failed ? 1 : 0);

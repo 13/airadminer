@@ -96,7 +96,11 @@ Without `-dsn`, you see a login screen like Adminer's. Credentials are held in t
 
 Rows are identified by their primary key. Tables without one fall back to `ctid` together with `xmin`. That pair names one version of one row, so if the row changed, or was deleted and its slot reused by `VACUUM`, the edit is refused instead of landing on another row. Reload the rows and try again. Views without a primary key are read-only.
 
-Values travel as PostgreSQL's own text format in both directions, the same text `psql` shows. Each edit is one `UPDATE … WHERE <key> RETURNING …`. A paste, clear or undo sends all its changes in one transaction. It is rejected if the row no longer matches exactly one record. The cell then shows the value the database returned, so triggers and defaults are reflected right away.
+Values travel as PostgreSQL's own text format in both directions, the same text `psql` shows. Each edit is one `UPDATE … WHERE <key> RETURNING …`. A paste, clear or undo sends all its changes in one transaction. It is rejected if the row no longer matches exactly one record.
+
+Edits never silently overwrite someone else's work. Each edit also sends the values you saw in the cells you changed. If someone else has changed one of those cells since, the edit is refused and you are asked to refresh. Undo works the same way: it reverts a cell only if the cell still holds what your change wrote.
+
+Writes are addressed by record, not by position on screen. An edit still lands on its record if a refresh or a new sort moved that record, and edits to one record are saved in the order you made them. A paste or clear first loads every row it covers, so rows that were not on screen are not skipped. Copying and pasting within airadminer keeps NULL apart from empty text. JSON is re-indented for editing without touching numbers, strings or key order. The cell then shows the value the database returned, so triggers and defaults are reflected right away.
 
 ## Build
 
@@ -106,6 +110,7 @@ make dist       # static binaries for linux/darwin/windows × amd64/arm64 in ./d
 make test       # go vet, go test -race, JS syntax check
 make lint       # gofmt, vet, staticcheck, govulncheck
 make test-integration  # tests against PostgreSQL (needs `make demo` running)
+make e2e        # browser tests of the grid in headless Chrome (needs `make demo`)
 make demo       # throwaway Postgres on :55432 with sample data (password: secret)
 ```
 

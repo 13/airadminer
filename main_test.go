@@ -319,7 +319,7 @@ func TestDuplicateSQLOverrides(t *testing.T) {
 func TestUpdateAndInsertSQL(t *testing.T) {
 	m := testMeta()
 	id, name := "7", "Ann"
-	st, err := updateSQL(m, rowKey{"id": &id}, map[string]*string{"name": &name, `we"ird`: nil})
+	st, err := updateSQL(m, rowKey{"id": &id}, map[string]*string{"name": &name, `we"ird`: nil}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -329,11 +329,19 @@ func TestUpdateAndInsertSQL(t *testing.T) {
 	if len(st.args) != 3 || st.args[1] != nil || string(st.args[2]) != "7" {
 		t.Fatalf("update args = %q", st.args)
 	}
-	if _, err := updateSQL(m, rowKey{"id": &id}, map[string]*string{"nope": &name}); err == nil {
+	if _, err := updateSQL(m, rowKey{"id": &id}, map[string]*string{"nope": &name}, nil); err == nil {
 		t.Fatal("expected error for unknown column")
 	}
-	if _, err := updateSQL(m, rowKey{}, map[string]*string{"name": &name}); err == nil {
+	if _, err := updateSQL(m, rowKey{}, map[string]*string{"name": &name}, nil); err == nil {
 		t.Fatal("expected error for missing key")
+	}
+	old := "Bob"
+	st, err = updateSQL(m, rowKey{"id": &id}, map[string]*string{"name": &name}, map[string]*string{"name": &old, `we"ird`: nil})
+	if want := `UPDATE "s"."t" SET "name" = $1 WHERE "id" = $2 AND "name" IS NOT NULL AND format('%s', "name") = $3 AND "we""ird" IS NULL RETURNING "id", "name", "we""ird"`; err != nil || st.sql != want {
+		t.Fatalf("update with expect = %s, %v", st.sql, err)
+	}
+	if _, err := updateSQL(m, rowKey{"id": &id}, map[string]*string{"name": &name}, map[string]*string{"nope": &old}); err == nil {
+		t.Fatal("expected error for unknown expect column")
 	}
 	st, err = insertSQL(m, nil)
 	if err != nil || !strings.HasPrefix(st.sql, `INSERT INTO "s"."t" DEFAULT VALUES RETURNING`) {

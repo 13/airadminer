@@ -2,7 +2,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 PLATFORMS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64
 
-.PHONY: build run test test-integration lint dist clean demo
+.PHONY: build run test test-integration e2e lint dist clean demo
 
 build:
 	CGO_ENABLED=0 go build -trimpath -ldflags '$(LDFLAGS)' -o airadminer .
@@ -18,6 +18,10 @@ test:
 # Needs `make demo` (or any PostgreSQL superuser DSN in AIRADMINER_TEST_DSN)
 test-integration:
 	AIRADMINER_TEST_DSN=$${AIRADMINER_TEST_DSN:-postgres://postgres:secret@127.0.0.1:55432/postgres} go test -race -count=1 ./...
+
+# Browser tests of the grid in headless Chrome (needs `make demo` and google-chrome)
+e2e: build
+	./e2e/run.sh
 
 lint:
 	test -z "$$(gofmt -l .)"
