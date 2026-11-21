@@ -70,6 +70,8 @@ const helpers = `
     await until(() => S.view && S.view.meta && S.view.meta.name === name && S.view.rows.ready, "table " + name);
   };
   window.col = (n) => S.view.grid.cols.findIndex((c) => c.name === n);
+  window.toggleSide = A.toggleSide; window.setDensity = A.setDensity; window.fitWidths = A.fitWidths;
+  window.drawnWidth = (g) => g.rnw + g.ws.reduce((a, b) => a + b, 0);
   __AA_E2E.confirm = true;   // confirm every dialog
   return true;
 `;
@@ -314,6 +316,95 @@ const tests = {
         const keyed = bodies.filter((b) => b.after || b.before).length;
         if (keyed < 15) throw new Error("only " + keyed + " of " + bodies.length + " page requests used a key");
       } finally { window.fetch = orig; }
+    `);
+  },
+
+  async "fit to screen fills the width, follows the sidebar and keeps proportions when resized"(sc) {
+    await send("Emulation.setDeviceMetricsOverride", { width: 1280, height: 800, deviceScaleFactor: 1, mobile: false });
+    try {
+      return await run(`
+        await sql("CREATE TABLE ${sc}.few (id int PRIMARY KEY, a text, b text, c text); INSERT INTO ${sc}.few SELECT g, 'x', 'y', 'z' FROM generate_series(1, 30) g");
+        await open_("${sc}", "few");
+        toggleSide(true);
+        const side = document.querySelector(".side");
+        await until(() => !side.inert && side.getBoundingClientRect().width > 200, "sidebar shown");
+        S.view.toggleFit();
+        const g = S.view.grid, sc = g.sc;
+        await until(() => g.fitted && drawnWidth(g) === sc.clientWidth, "columns fill the width");
+        if (sc.scrollWidth > sc.clientWidth) throw new Error("fitted grid scrolls sideways: " + sc.scrollWidth + " > " + sc.clientWidth + " " + [...sc.querySelectorAll("*")].filter((e) => e.getBoundingClientRect().right > sc.getBoundingClientRect().left + sc.clientWidth + 1).slice(0, 4).map((e) => e.className + ":" + Math.round(e.getBoundingClientRect().right - sc.getBoundingClientRect().left)).join(" | "));
+        if (!document.querySelector("[data-view]").classList.contains("on")) throw new Error("View button does not show fit mode");
+        const saved = g.cols.map((c) => c.width).join();
+
+        // Collapse with the shortcut: sidebar goes inert, grid refits wider.
+        const w0 = sc.clientWidth;
+        document.dispatchEvent(new KeyboardEvent("keydown", { key: "b", ctrlKey: true, metaKey: true, bubbles: true }));
+        await until(() => side.inert && sc.clientWidth > w0 + 200 && drawnWidth(g) === sc.clientWidth, "grid refit after collapse");
+        if (localStorage.getItem("aa.side") !== "false") throw new Error("collapsed state not saved");
+        if (document.querySelector("[data-menu]").getAttribute("aria-expanded") !== "false") throw new Error("toggle not marked collapsed");
+        if (g.cols.map((c) => c.width).join() !== saved) throw new Error("fit changed the saved widths");
+
+        // Drag a column edge 60px: the drawn edge follows the pointer, total stays exact.
+        const h = g.head.querySelector('.g-h[data-c="1"]'), rs = h.querySelector("[data-rs]");
+        const e1 = g.ws[1], x = h.getBoundingClientRect().right;
+        rs.dispatchEvent(new MouseEvent("mousedown", { clientX: x, bubbles: true }));
+        dispatchEvent(new MouseEvent("mousemove", { clientX: x + 60 }));
+        dispatchEvent(new MouseEvent("mouseup", { clientX: x + 60 }));
+        if (Math.abs(g.ws[1] - (e1 + 60)) > 3) throw new Error("resized column is " + g.ws[1] + ", wanted about " + (e1 + 60));
+        if (drawnWidth(g) !== sc.clientWidth) throw new Error("total width after resize " + drawnWidth(g) + " != " + sc.clientWidth);
+
+        S.view.toggleFit();
+        toggleSide(true);
+        if (g.fitted) throw new Error("fit did not turn off");
+      `);
+    } finally {
+      await send("Emulation.clearDeviceMetricsOverride");
+    }
+  },
+
+  async "fit falls back to scrolling for wide tables, and compact rows line up"(sc) {
+    await send("Emulation.setDeviceMetricsOverride", { width: 1280, height: 800, deviceScaleFactor: 1, mobile: false });
+    try {
+      return await run(`
+        const cols = Array.from({ length: 60 }, (_, i) => "c" + i + " text").join(", ");
+        await sql("CREATE TABLE ${sc}.wide (id int PRIMARY KEY, " + cols + "); INSERT INTO ${sc}.wide (id) SELECT g FROM generate_series(1, 200) g");
+        await open_("${sc}", "wide");
+        S.view.toggleFit();
+        const g = S.view.grid, sc = g.sc;
+        if (g.fitted) throw new Error("61 columns claimed to fit in " + sc.clientWidth + "px");
+        if (sc.scrollWidth <= sc.clientWidth) throw new Error("wide table does not scroll");
+        const ws = fitWidths([100, 300, 10], 200, 50);
+        if (ws.join() !== "50,100,50") throw new Error("fitWidths: " + ws);
+        if (fitWidths([100, 100], 90, 50) !== null) throw new Error("fitWidths fits below the minimum");
+
+        setDensity("compact");
+        await until(() => document.documentElement.dataset.density === "compact", "compact");
+        if (g.rh !== 26) throw new Error("compact row height " + g.rh);
+        if (g.head.getBoundingClientRect().height !== g.headH) throw new Error("header is " + g.head.getBoundingClientRect().height + "px, grid assumes " + g.headH);
+        const r = g.body.querySelector('.g-row[data-r="10"]');
+        if (!r || r.offsetTop !== 260 || r.getBoundingClientRect().height !== 26) throw new Error("row 10 at " + (r && r.offsetTop));
+        g.scrollTo(150, 0);
+        await until(() => g.body.querySelector('.g-row[data-r="150"]'), "row 150 drawn after scroll");
+        setDensity("comfortable");
+        if (g.rh !== 33) throw new Error("comfortable row height " + g.rh);
+        S.view.toggleFit();
+      `);
+    } finally {
+      await send("Emulation.clearDeviceMetricsOverride");
+    }
+  },
+
+  async "default widths follow the values, not long field names"(sc) {
+    return run(`
+      await sql("CREATE TABLE ${sc}.sensors (id int PRIMARY KEY, battery_powered_and_alert_missing boolean, description text); INSERT INTO ${sc}.sensors VALUES (1, true, 'DS18B20 + Si7021 + BMP280'), (14, false, 'short')");
+      await open_("${sc}", "sensors");
+      await until(() => S.view.autoW.size, "measured widths");
+      const g = S.view.grid, w = (n) => g.cols[col(n)].width;
+      if (w("id") > 80) throw new Error("id is " + w("id") + "px wide");
+      if (w("battery_powered_and_alert_missing") > 140) throw new Error("long-named flag is " + w("battery_powered_and_alert_missing") + "px wide");
+      const d = g.body.querySelector('.g-row[data-r="0"] .g-c[data-c="' + col("description") + '"] .v');
+      if (d.scrollWidth > d.clientWidth) throw new Error("description is cut: " + d.scrollWidth + " > " + d.clientWidth);
+      const h = g.head.querySelector('.g-h[data-c="' + col("battery_powered_and_alert_missing") + '"]');
+      if (!h.title.startsWith("battery_powered_and_alert_missing")) throw new Error("header tooltip: " + h.title);
     `);
   },
 

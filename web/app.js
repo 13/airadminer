@@ -203,10 +203,78 @@ const KIND_ICON = {
   json: "t-json", uuid: "t-id", enum: "t-enum", array: "t-array", blob: "t-blob", range: "t-range",
   net: "t-net", link: "i-link", other: "t-other",
 };
-const KIND_WIDTH = {
-  num: 120, bool: 92, date: 128, datetime: 200, time: 120, uuid: 300, json: 280, text: 220,
-  enum: 140, array: 200, link: 120, blob: 120, range: 260, net: 150, other: 180,
+
+// ---------- default column widths
+//
+// A column is as wide as its values, not its name: the header makes room for
+// at most HEAD_NAME_MAX px of the name (the rest is cut, the full name is in
+// the tooltip), so a flag called battery_powered stays narrow. Explicit
+// "Fit width to content" still shows the whole name.
+
+const HEAD_NAME_MAX = 72;
+const COL_MIN = 56, COL_MAX = 340;
+// Before any rows load: a guess per kind, replaced once the first page arrives.
+const KIND_GUESS = {
+  num: 72, bool: 40, date: 96, datetime: 190, time: 90, uuid: 290, json: 240, text: 180,
+  enum: 100, array: 180, link: 80, blob: 80, range: 240, net: 130, other: 160,
 };
+
+let measureCtx = null, measureFonts = null;
+function textW(s, font) {
+  measureCtx ||= document.createElement("canvas").getContext("2d");
+  if (!measureFonts) {
+    const cs = getComputedStyle(document.documentElement);
+    measureFonts = { sans: cs.getPropertyValue("--font").trim() || "sans-serif", mono: cs.getPropertyValue("--mono").trim() || "monospace" };
+  }
+  measureCtx.font = font.replace("SANS", measureFonts.sans).replace("MONO", measureFonts.mono);
+  return measureCtx.measureText(s).width;
+}
+
+// Width the header needs: type icon, name (capped unless full) and one slot
+// for the key icon or sort arrow (they share it), plus padding and gaps.
+function headerWidth(col, full) {
+  const name = textW(col.label, "550 12.5px SANS");
+  return 42 + (full ? name : Math.min(name, HEAD_NAME_MAX)) + 18;
+}
+
+// Drawn width of one value, without cell padding (mirrors renderValue).
+function valueWidth(kind, v) {
+  if (v === null || v === undefined) return textW("null", "italic 12px MONO");
+  const s = String(v).slice(0, 120);
+  switch (kind) {
+    case "bool": return 16;
+    case "num": return textW(s, "12.5px MONO");
+    case "enum": return textW(s, "550 12px SANS") + 16;
+    case "link": return textW(s, "550 12.5px SANS") + 34;
+    case "datetime": {
+      const m = /^(\S+) (\d\d:\d\d)(:\d\d)?(\.\d+)?(.*)$/.exec(s);
+      if (!m) return textW(s, "13px SANS");
+      const secs = m[3] && m[3] !== ":00" ? m[3] : "";
+      return textW(m[1], "13px SANS") + 6 + textW(m[2] + secs + (m[5] ? " " + m[5] : ""), "13px SANS");
+    }
+    case "uuid": case "json": case "other": case "range": return textW(s, "12px MONO");
+    case "blob": return 60;
+    case "array": {
+      const items = parseArray(String(v));
+      if (!items) return textW(s, "12px MONO");
+      if (!items.length) return textW("empty list", "13px SANS");
+      return items.slice(0, 6).reduce((w, x) => w + 4 + 16 + textW(x === null ? "null" : String(x), "550 12px SANS"), -4);
+    }
+    // Single-line rows show line breaks as " ↵ " (see renderValue).
+    default: return textW(s.replace(/\r?\n/g, " ↵ "), "13px SANS");
+  }
+}
+
+// Default width of a column from a sample of rows (none: a guess by kind).
+function columnWidth(col, rows) {
+  const pad = 2 * (S.density === "compact" ? 6 : 10) + 4;
+  let content = KIND_GUESS[col.kind] || 160;
+  if (rows && rows.length) {
+    content = 0;
+    for (const row of rows) if (row) content = Math.max(content, valueWidth(col.kind, row[col.idx]));
+  }
+  return Math.round(Math.max(COL_MIN, Math.min(COL_MAX, Math.max(content + pad, headerWidth(col)))));
+}
 
 function kindOf(c) {
   if (c.fk) return "link";
@@ -386,8 +454,37 @@ function download(name, blob) {
 
 // ============================================================ grid
 
-const HEAD = 34;
-const ROW_HEIGHTS = [33, 58, 96];
+// Sizes per density (S.density). CSS mirrors HEAD_H in --head-h.
+const HEAD_H = { comfortable: 34, compact: 28 };
+const ROW_HEIGHTS = { comfortable: [33, 58, 96], compact: [26, 46, 78] };
+// Narrowest a column gets when fitted to the screen; below this the grid scrolls.
+const FIT_MIN = { comfortable: 56, compact: 44 };
+
+// Scale widths so they sum to exactly `avail`, keeping proportions but never
+// going below `min`. Returns null when even `min` per column does not fit.
+function fitWidths(ws, avail, min) {
+  const n = ws.length;
+  if (!n || avail < n * min) return null;
+  const out = new Array(n).fill(0), pinned = new Array(n).fill(false);
+  for (;;) {
+    let free = avail, sum = 0;
+    for (let i = 0; i < n; i++) pinned[i] ? (free -= min) : (sum += ws[i]);
+    const k = sum > 0 ? free / sum : 0;
+    let changed = false;
+    for (let i = 0; i < n; i++) {
+      if (pinned[i]) { out[i] = min; continue; }
+      out[i] = ws[i] * k;
+      if (out[i] < min) { pinned[i] = true; changed = true; }
+    }
+    if (!changed) break;
+  }
+  // Whole pixels, with the rounding remainder on the last column, so the
+  // total is exact and no 1px horizontal scrollbar appears.
+  let used = 0;
+  for (let i = 0; i < n - 1; i++) { out[i] = Math.floor(out[i]); used += out[i]; }
+  out[n - 1] = avail - used;
+  return out;
+}
 
 /*
  * Grid renders a virtual window of rows from a source:
@@ -399,6 +496,9 @@ class Grid {
     this.o = o;
     this.cols = [];
     this.rhIndex = o.rh || 0;
+    this.fit = !!o.fit;
+    this.fitted = false;
+    this.ws = [];
     this.sel = null;
     this.picked = new Set();
     this.drawn = null;
@@ -412,7 +512,8 @@ class Grid {
     this.bind();
   }
 
-  get rh() { return ROW_HEIGHTS[this.rhIndex]; }
+  get rh() { return ROW_HEIGHTS[S.density][this.rhIndex]; }
+  get headH() { return HEAD_H[S.density]; }
 
   // Columns (besides the frozen first one) that overlap the visible width,
   // plus a margin: only these get cells, so wide tables stay fast.
@@ -420,7 +521,7 @@ class Grid {
     const cols = this.cols, sc = this.sc;
     const x0 = sc.scrollLeft - 240, x1 = sc.scrollLeft + sc.clientWidth + 240;
     let a = 1, b = cols.length - 1;
-    while (a <= b && this.lefts[a] + cols[a].width < x0) a++;
+    while (a <= b && this.lefts[a] + this.ws[a] < x0) a++;
     while (b >= a && this.lefts[b] > x1) b--;
     return [a, b];
   }
@@ -428,19 +529,29 @@ class Grid {
 
   setCols(cols) { this.cols = cols; this.renderHead(); this.layout(); this.draw(true); }
   setRowHeight(i) { this.rhIndex = i; this.layout(); this.draw(true); }
+  setFit(on) { this.fit = !!on; this.layout(); this.draw(true); if (this.sel) this.scrollTo(this.sel.r2, this.sel.c2); }
 
+  // Column widths as drawn: the saved widths, or in fit mode those widths
+  // scaled to fill the visible width (saved widths act as proportions and
+  // are never overwritten).
   layout() {
-    const rnw = this.rnw;
+    const rnw = this.rnw, cols = this.cols;
+    const n = this.o.source.count();
+    // Body height first: it decides whether a vertical scrollbar takes width.
+    this.body.style.height = n * this.rh + (this.o.onAdd ? 36 : 0) + 48 + "px";
+    const fitted = this.fit && fitWidths(cols.map((c) => c.width), this.sc.clientWidth - rnw, FIT_MIN[S.density]);
+    this.fitted = !!fitted;
+    this.ws = fitted || cols.map((c) => c.width);
     this.lefts = [];
     let x = rnw;
-    for (const c of this.cols) { this.lefts.push(x); x += c.width; }
+    for (const w of this.ws) { this.lefts.push(x); x += w; }
     const st = this.sc.style;
-    st.setProperty("--cols", `${rnw}px ${this.cols.map((c) => c.width + "px").join(" ")} minmax(60px, 1fr)`);
-    st.setProperty("--total", x + 60 + "px");
+    const fill = this.fitted ? "minmax(0px, 1fr)" : "minmax(60px, 1fr)";
+    st.setProperty("--cols", `${rnw}px ${this.ws.map((w) => w + "px").join(" ")} ${fill}`);
+    st.setProperty("--total", x + (this.fitted ? 0 : 60) + "px");
     st.setProperty("--rnw", rnw + "px");
     st.setProperty("--rh", this.rh + "px");
-    const n = this.o.source.count();
-    this.body.style.height = n * this.rh + (this.o.onAdd ? 36 : 0) + 48 + "px";
+    this.el.classList.toggle("fitted", this.fitted);
   }
 
   renderHead() {
@@ -448,7 +559,7 @@ class Grid {
     this.head.innerHTML = `<div class="g-h g-rn">${pickAll}</div>` + this.cols.map((c, i) => `
       <div class="g-h${i === 0 ? " g-f0" : ""}${c.filtered ? " filtered" : ""}" data-c="${i}" role="columnheader" title="${esc(c.name + (c.type ? "  " + c.type : ""))}">
         ${icon(KIND_ICON[c.kind] || "t-other", "sm ty")}<span class="nm">${esc(c.label)}</span>
-        ${c.pk ? icon("i-key", "xs keyic") : ""}${c.sortDir ? icon(c.sortDir === "asc" ? "i-arrow-up" : "i-arrow-down", "xs sorted") : ""}
+        ${c.sortDir ? icon(c.sortDir === "asc" ? "i-arrow-up" : "i-arrow-down", "xs sorted") : c.pk ? icon("i-key", "xs keyic") : ""}
         <span class="rs" data-rs></span></div>`).join("") + `<div class="g-h g-fill"></div>`;
   }
 
@@ -456,7 +567,7 @@ class Grid {
     const n = this.o.source.count();
     const top = this.sc.scrollTop;
     const first = Math.max(0, Math.floor(top / this.rh) - 4);
-    const last = Math.min(n - 1, Math.ceil((top + this.sc.clientHeight - HEAD) / this.rh) + 4);
+    const last = Math.min(n - 1, Math.ceil((top + this.sc.clientHeight - this.headH) / this.rh) + 4);
     return [first, last];
   }
 
@@ -594,11 +705,11 @@ class Grid {
     const sc = this.sc, rh = this.rh;
     const top = r * rh;
     if (top < sc.scrollTop) sc.scrollTop = top;
-    else if (HEAD + top + rh > sc.scrollTop + sc.clientHeight) sc.scrollTop = HEAD + top + rh - sc.clientHeight;
+    else if (this.headH + top + rh > sc.scrollTop + sc.clientHeight) sc.scrollTop = this.headH + top + rh - sc.clientHeight;
     if (c > 0) {
-      const left = this.lefts[c], right = left + this.cols[c].width;
-      const frozenEdge = sc.scrollLeft + this.rnw + this.cols[0].width;
-      if (left < frozenEdge) sc.scrollLeft = left - this.rnw - this.cols[0].width;
+      const left = this.lefts[c], right = left + this.ws[c];
+      const frozenEdge = sc.scrollLeft + this.rnw + this.ws[0];
+      if (left < frozenEdge) sc.scrollLeft = left - this.rnw - this.ws[0];
       else if (right > sc.scrollLeft + sc.clientWidth) sc.scrollLeft = right - sc.clientWidth + 2;
     }
     this.draw();
@@ -624,7 +735,16 @@ class Grid {
       if (this.editor) this.placeEditor();
       if (!raf) raf = requestAnimationFrame(() => { raf = 0; this.draw(); });
     }, { passive: true });
-    this.ro = new ResizeObserver(() => this.draw());
+    let roRaf = 0, roW = -1;
+    this.ro = new ResizeObserver(() => {
+      if (roRaf) return;
+      roRaf = requestAnimationFrame(() => {
+        roRaf = 0;
+        const w = sc.clientWidth;
+        if (this.fit && w !== roW) { roW = w; this.layout(); if (this.editor) this.placeEditor(); }
+        this.draw();
+      });
+    });
     this.ro.observe(sc);
 
     // header: sort/menu + column resize
@@ -633,9 +753,20 @@ class Grid {
       if (rs) {
         e.preventDefault();
         const c = +rs.parentElement.dataset.c, col = this.cols[c];
-        const x0 = e.clientX, w0 = col.width;
+        const x0 = e.clientX, w0 = col.width, e0 = this.ws[c];
         rs.classList.add("drag");
-        const mv = (ev) => { col.width = Math.max(60, Math.min(900, w0 + ev.clientX - x0)); this.layout(); this.draw(); };
+        const mv = (ev) => {
+          const dx = ev.clientX - x0;
+          if (this.fitted && this.cols.length > 1) {
+            // Saved widths are proportions here: pick the one that puts this
+            // column's drawn edge under the pointer once the others rebalance.
+            const min = FIT_MIN[S.density], avail = this.sc.clientWidth - this.rnw;
+            const target = Math.max(min, Math.min(avail - (this.cols.length - 1) * min, e0 + dx));
+            const others = this.cols.reduce((s, x, i) => (i === c ? s : s + x.width), 0);
+            col.width = Math.round(Math.max(20, Math.min(4000, (target * others) / Math.max(1, avail - target))));
+          } else col.width = Math.max(60, Math.min(900, w0 + dx));
+          this.layout(); this.draw();
+        };
         const up = () => { rs.classList.remove("drag"); removeEventListener("mousemove", mv); removeEventListener("mouseup", up); this.o.onResize && this.o.onResize(col); };
         addEventListener("mousemove", mv); addEventListener("mouseup", up);
       }
@@ -732,16 +863,14 @@ class Grid {
   }
 
   autosize(col) {
-    let w = col.label.length * 7.4 + 56;
+    let w = headerWidth(col, true);
     const [a, b] = this.drawn || [0, 0];
-    const ctx = (this._ctx ||= document.createElement("canvas").getContext("2d"));
-    ctx.font = "13px " + getComputedStyle(document.body).fontFamily;
+    const pad = 2 * (S.density === "compact" ? 6 : 10) + 4;
     for (let r = a; r <= b; r++) {
       const row = this.o.source.get(r);
-      const v = row && row[col.idx];
-      if (v) w = Math.max(w, ctx.measureText(String(v).slice(0, 120)).width + 34);
+      if (row) w = Math.max(w, valueWidth(col.kind, row[col.idx]) + pad);
     }
-    col.width = Math.round(Math.min(560, Math.max(70, w)));
+    col.width = Math.round(Math.min(560, Math.max(COL_MIN, w)));
     this.layout();
     this.o.onResize && this.o.onResize(col);
   }
@@ -761,7 +890,7 @@ class Grid {
       return;
     }
     const s = this.sel;
-    const page = Math.max(1, Math.floor((this.sc.clientHeight - HEAD) / this.rh) - 1);
+    const page = Math.max(1, Math.floor((this.sc.clientHeight - this.headH) / this.rh) - 1);
     const last = this.cols.length - 1;
     const mv = (r, c) => { e.preventDefault(); this.select(r, c, e.shiftKey); };
     switch (k) {
@@ -881,9 +1010,9 @@ class Grid {
     if (!ed) return;
     const { r, c, col, el, multi } = ed;
     const left = c === 0 ? Math.max(this.lefts[0], this.sc.scrollLeft + this.rnw) : this.lefts[c];
-    el.style.top = HEAD + r * this.rh + "px";
+    el.style.top = this.headH + r * this.rh + "px";
     el.style.left = left + "px";
-    el.style.width = (multi ? Math.max(col.width, 360) : Math.max(col.width, 160)) + "px";
+    el.style.width = (multi ? Math.max(this.ws[c], 360) : Math.max(this.ws[c], 160)) + "px";
     if (!multi) el.style.height = this.rh + "px";
   }
 
@@ -980,11 +1109,92 @@ const S = {
   tables: [],
   schemas: [],
   collapsed: new Set(store.get("aa.collapsed", [])),
+  side: store.get("aa.side", true) !== false,
+  density: store.get("aa.density", "comfortable") === "compact" ? "compact" : "comfortable",
   view: null,
   filterText: "",
   pendingFilter: null,
 };
 const app = $("#app");
+document.documentElement.dataset.density = S.density;
+
+// ---------- layout preferences: sidebar, density, fit to screen
+
+// Below this width the sidebar is an overlay drawer (see app.css).
+const NARROW = matchMedia("(max-width: 820px)");
+
+function sideShown() {
+  const shell = $(".shell");
+  if (!shell) return false;
+  return NARROW.matches ? shell.classList.contains("side-open") : S.side;
+}
+
+// One toggle for both layouts: on wide screens it collapses the sidebar
+// (remembered), on narrow ones it opens the drawer.
+function toggleSide(show) {
+  const shell = $(".shell");
+  if (!shell) return;
+  const next = show ?? !sideShown();
+  if (NARROW.matches) shell.classList.toggle("side-open", next);
+  else { S.side = next; store.set("aa.side", next); }
+  paintSide();
+}
+
+function paintSide() {
+  const shell = $(".shell");
+  if (!shell) return;
+  shell.classList.toggle("side-collapsed", !S.side);
+  const shown = sideShown();
+  const side = $(".side", shell);
+  // A hidden sidebar must not take focus: move it out before going inert.
+  if (!shown && side.contains(document.activeElement)) $("[data-menu]")?.focus();
+  side.inert = !shown;
+  for (const b of $$("[data-menu]")) {
+    b.setAttribute("aria-expanded", String(shown));
+    b.setAttribute("aria-label", shown ? "Hide sidebar" : "Show sidebar");
+    b.title = `${shown ? "Hide" : "Show"} sidebar (${MOD === "⌘" ? "⌘B" : "Ctrl+B"})`;
+  }
+}
+NARROW.addEventListener("change", () => { $(".shell")?.classList.remove("side-open"); paintSide(); });
+
+function setDensity(d) {
+  S.density = d === "compact" ? "compact" : "comfortable";
+  store.set("aa.density", S.density);
+  document.documentElement.dataset.density = S.density;
+  const g = S.view && S.view.grid;
+  if (g) g.refresh();
+}
+
+function toggleFit() {
+  if (S.view && S.view.toggleFit) S.view.toggleFit();
+}
+
+const FIT_KEY = MOD === "⌘" ? "⌘⇧F" : "Ctrl+Shift+F";
+
+// Row height, density and fit-to-screen for a view with a grid
+// (TableView or SqlView: rowHeight/setRowHeight/fit/toggleFit).
+function viewMenu(anchor, view) {
+  const chk = (on) => (on ? `<span class="r">${icon("i-check", "sm")}</span>` : "");
+  const el = html(`<div style="min-width:230px" role="menu" tabindex="-1">
+    <h4>Row height</h4>
+    ${["Short", "Medium", "Tall"].map((n, i) => `<button class="mi ${view.rowHeight === i ? "on" : ""}" data-rh="${i}" role="menuitemradio" aria-checked="${view.rowHeight === i}">${icon("i-rows")}${n}${chk(view.rowHeight === i)}</button>`).join("")}
+    <hr><h4>Density</h4>
+    ${[["comfortable", "Comfortable"], ["compact", "Compact"]].map(([d, n]) => `<button class="mi ${S.density === d ? "on" : ""}" data-density="${d}" role="menuitemradio" aria-checked="${S.density === d}">${icon("i-grid")}${n}${chk(S.density === d)}</button>`).join("")}
+    <hr>
+    <button class="mi ${view.fit ? "on" : ""}" data-fit role="menuitemcheckbox" aria-checked="${view.fit}">${icon("i-expand")}Fit columns to screen<span class="r">${view.fit ? icon("i-check", "sm") : `<span class="kbd">${FIT_KEY}</span>`}</span></button>
+  </div>`);
+  openPop(anchor, el);
+  menuKeys(el, el);
+  el.focus();
+  el.addEventListener("click", (e) => {
+    const b = e.target.closest("button");
+    if (!b) return;
+    closePop();
+    if (b.dataset.rh != null) view.setRowHeight(+b.dataset.rh);
+    else if (b.dataset.density) setDensity(b.dataset.density);
+    else if (b.hasAttribute("data-fit")) view.toggleFit();
+  });
+}
 
 function signedOut() {
   if (!S.meta && !S.view) return; // several requests can see the same 401
@@ -1089,8 +1299,8 @@ async function loadTables() {
 async function renderShell() {
   try { await loadTables(); } catch (e) { toastErr(e); }
   app.innerHTML = `
-  <div class="shell">
-    <aside class="side" aria-label="Tables">
+  <div class="shell${S.side ? "" : " side-collapsed"}">
+    <aside class="side" id="side" aria-label="Tables">
       <div class="side-top">
         <button class="db-switch" data-db title="Switch database">${icon("i-db")}<span class="name"></span>${icon("i-down", "sm")}</button>
         <div class="side-search">${icon("i-search", "sm")}<input class="input" data-find placeholder="Find a table" spellcheck="false" aria-label="Find a table"><span class="kbd">${MOD === "⌘" ? "⌘K" : "Ctrl K"}</span></div>
@@ -1126,9 +1336,10 @@ async function renderShell() {
       store.set("aa.collapsed", [...S.collapsed]);
       paintTables();
     }
-    if (e.target.closest(".tbl")) $(".shell").classList.remove("side-open");
+    if (e.target.closest(".tbl") && NARROW.matches) toggleSide(false);
   });
   paintThemeBtn();
+  paintSide();
   route();
 }
 
@@ -1251,11 +1462,12 @@ function route() {
 addEventListener("hashchange", route);
 
 function topbar(inner) {
-  return `<header class="topbar"><button class="btn icon menu-btn" data-menu aria-label="Show tables">${icon("i-menu")}</button>${inner}</header>`;
+  return `<header class="topbar"><button class="btn icon menu-btn" data-menu aria-controls="side">${icon("i-sidebar")}</button>${inner}</header>`;
 }
 function bindTopbar(root) {
   const m = $("[data-menu]", root);
-  if (m) m.onclick = () => $(".shell").classList.toggle("side-open");
+  if (m) m.onclick = () => toggleSide();
+  paintSide();
 }
 
 function renderEmpty(main) {
@@ -1360,6 +1572,7 @@ class RowStore {
         this.view.countChanged();
       }
       this.ready = true;
+      if (!this.view.autoW.size && res.rows.length) this.view.sizeColumns(res.rows);
       this.view.grid.draw(true);
     } catch (e) {
       if (gen === this.gen) toastErr(e);
@@ -1420,7 +1633,7 @@ class TableView {
     this.writeChain = Promise.resolve();
     this.lastMs = null;
     this.key = `aa.v:${S.meta.database}:${ref.schema}.${ref.name}`;
-    this.settings = Object.assign({ hidden: [], widths: {}, sort: [], filters: [], rh: 0, search: "" }, store.get(this.key, {}));
+    this.settings = Object.assign({ hidden: [], widths: {}, sort: [], filters: [], rh: 0, search: "", fit: false }, store.get(this.key, {}));
     if (S.pendingFilter && S.pendingFilter.schema === ref.schema && S.pendingFilter.name === ref.name) {
       this.settings.filters = [S.pendingFilter.filter];
       this.settings.search = "";
@@ -1487,10 +1700,12 @@ class TableView {
   renderGrid() {
     this.body.innerHTML = `<div class="toolbar" data-tools></div><div class="grid-wrap" data-gw></div>`;
     this.rows = new RowStore(this);
+    this.autoW ||= new Map();
     this.grid = new Grid($("[data-gw]", this.body), {
       label: this.meta.name,
       source: this.rows,
       rh: this.settings.rh,
+      fit: this.settings.fit,
       pick: this.editable,
       onExpand: (r) => this.expand(r),
       onAdd: this.editable ? () => openRecord({ meta: this.meta, view: this, isNew: true }) : null,
@@ -1520,14 +1735,24 @@ class TableView {
     const filtered = new Set(this.activeFilters().map((f) => f.col));
     return this.meta.columns.map((c, i) => ({ c, i })).filter(({ c }) => !hidden.has(c.name)).map(({ c, i }) => {
       const kind = kindOf(c);
-      const w = this.settings.widths[c.name] || Math.min(340, Math.max(KIND_WIDTH[kind] || 180, c.name.length * 7.4 + 60));
+      const idx = i + this.offset;
+      const w = this.settings.widths[c.name] || this.autoW.get(c.name) || columnWidth({ label: c.name, kind, pk: c.pk, idx }, null);
       return {
-        name: c.name, label: c.name, kind, idx: i + this.offset, width: Math.round(w), type: c.type,
+        name: c.name, label: c.name, kind, idx, width: Math.round(w), type: c.type,
         pk: c.pk, fk: c.fk, enum: c.enum, nullable: c.nullable, meta: c,
         readonly: !this.editable || c.generated === "s" || c.identity === "a" || kind === "blob",
         sortDir: sortBy.get(c.name), filtered: filtered.has(c.name),
       };
     });
+  }
+
+  // Default widths from the first rows loaded, for fields without a saved
+  // width. Measured once per open; not saved, so they follow the data.
+  sizeColumns(rows) {
+    this.meta.columns.forEach((c, i) => {
+      this.autoW.set(c.name, columnWidth({ label: c.name, kind: kindOf(c), pk: c.pk, idx: i + this.offset }, rows));
+    });
+    if (this.grid && this.meta.columns.some((c) => !this.settings.widths[c.name])) this.grid.setCols(this.columns());
   }
 
   activeFilters() {
@@ -1611,7 +1836,7 @@ class TableView {
       <button class="btn" data-fields>${icon("i-eyeoff")}<span class="lbl-txt" data-l>Hide fields</span></button>
       <button class="btn" data-filter>${icon("i-filter")}<span class="lbl-txt" data-l>Filter</span></button>
       <button class="btn" data-sort>${icon("i-sort")}<span class="lbl-txt" data-l>Sort</span></button>
-      <button class="btn" data-rh title="Row height">${icon("i-rows")}<span class="lbl-txt">Row height</span></button>
+      <button class="btn" data-view title="Row height, density and fit to screen">${icon("i-columns")}<span class="lbl-txt" data-l>View</span></button>
       <span class="sep"></span>
       <div class="tsearch">${icon("i-search", "sm")}<input class="input" data-search placeholder="Search all fields" spellcheck="false" aria-label="Search all fields"></div>
       <span class="spacer"></span>
@@ -1626,7 +1851,7 @@ class TableView {
     $("[data-fields]", t).onclick = (e) => this.fieldsMenu(e.currentTarget);
     $("[data-filter]", t).onclick = (e) => this.filterMenu(e.currentTarget);
     $("[data-sort]", t).onclick = (e) => this.sortMenu(e.currentTarget);
-    $("[data-rh]", t).onclick = (e) => this.rowHeightMenu(e.currentTarget);
+    $("[data-view]", t).onclick = (e) => viewMenu(e.currentTarget, this);
     $("[data-export]", t).onclick = () => this.exportCSV();
     const add = $("[data-add]", t);
     if (add) add.onclick = () => openRecord({ meta: this.meta, view: this, isNew: true });
@@ -1644,6 +1869,7 @@ class TableView {
     set("[data-fields]", this.settings.hidden.length, "Hide fields", (n) => `${n} hidden ${n === 1 ? "field" : "fields"}`);
     set("[data-filter]", this.activeFilters().length, "Filter", (n) => `Filtered by ${n} ${n === 1 ? "field" : "fields"}`);
     set("[data-sort]", this.settings.sort.length, "Sort", (n) => `Sorted by ${n} ${n === 1 ? "field" : "fields"}`);
+    set("[data-view]", this.settings.fit ? 1 : 0, "View", () => "Fit to screen");
     const rc = $("[data-count]", t);
     if (rc) rc.textContent = this.countText();
   }
@@ -1775,16 +2001,16 @@ class TableView {
     });
   }
 
-  rowHeightMenu(anchor) {
-    const el = html(`<div style="width:180px">${["Short", "Medium", "Tall"].map((n, i) => `<button class="mi ${this.settings.rh === i ? "on" : ""}" data-i="${i}">${icon("i-rows")}${n}${this.settings.rh === i ? `<span class="r">${icon("i-check", "sm")}</span>` : ""}</button>`).join("")}</div>`);
-    openPop(anchor, el);
-    el.addEventListener("click", (e) => {
-      const b = e.target.closest("[data-i]");
-      if (!b) return;
-      this.settings.rh = +b.dataset.i; this.save();
-      this.grid.setRowHeight(this.settings.rh);
-      closePop();
-    });
+  // Hooks for viewMenu() and the fit shortcut.
+  get rowHeight() { return this.settings.rh; }
+  setRowHeight(i) { this.settings.rh = i; this.save(); this.grid && this.grid.setRowHeight(i); }
+  get fit() { return !!this.settings.fit; }
+  toggleFit() {
+    if (!this.grid) return;
+    this.settings.fit = !this.settings.fit; this.save();
+    this.grid.setFit(this.settings.fit);
+    this.paintToolState();
+    toast(this.settings.fit ? "Columns fit to screen" : "Columns at saved widths", { ms: 1400 });
   }
 
   columnMenu(col, anchor) {
@@ -2704,6 +2930,7 @@ class SqlView {
           <div class="rtabs tabs" data-rtabs hidden></div>
           <span class="stat" data-stat>Runs the selection, or everything when nothing is selected.</span>
           <span class="spacer"></span>
+          <button class="btn" data-view hidden title="Row height, density and fit to screen">${icon("i-columns")}<span class="lbl-txt">View</span></button>
           <button class="btn" data-csv hidden>${icon("i-download")}<span class="lbl-txt">CSV</span></button>
         </div>
         <div class="sql-out" data-out></div>
@@ -2723,9 +2950,21 @@ class SqlView {
     $("[data-stop]", main).onclick = () => this.ctl && this.ctl.abort();
     $("[data-hist]", main).onclick = (e) => this.history(e.currentTarget);
     $("[data-csv]", main).onclick = () => this.csv();
+    $("[data-view]", main).onclick = (e) => viewMenu(e.currentTarget, this);
     this.splitter($(".sql-split", main), ed);
     this.ta.focus();
     this.saveText = debounce(() => store.set("aa.sql." + S.meta.database, this.ta.value), 300);
+  }
+
+  // Hooks for viewMenu() and the fit shortcut; kept for all result grids.
+  get rowHeight() { return store.get("aa.sqlview.rh", 0); }
+  setRowHeight(i) { store.set("aa.sqlview.rh", i); this.grid && this.grid.setRowHeight(i); }
+  get fit() { return store.get("aa.sqlview.fit", false); }
+  toggleFit() {
+    const on = !this.fit;
+    store.set("aa.sqlview.fit", on);
+    this.grid && this.grid.setFit(on);
+    $("[data-view]", this.main).classList.toggle("on", on);
   }
 
   paint() {
@@ -2834,16 +3073,20 @@ class SqlView {
       errHTML = `<div class="sql-msg"><div class="sql-err" role="alert"><b>${esc(e.error || e.message)}</b>${e.detail ? `<p>${esc(e.detail)}</p>` : ""}${e.hint ? `<p>Hint: ${esc(e.hint)}</p>` : ""}${e.code ? `<p class="muted">SQLSTATE ${esc(e.code)}</p>` : ""}${res.results.some((r) => !r.columns) && !/\b(begin|commit|start\s+transaction)\b/i.test(this.sql) ? `<p class="muted">Statements sent together run as one transaction, so the changes made before this error were rolled back.</p>` : ""}${where}</div></div>`;
     }
     csv.hidden = !cur || !cur.columns;
+    $("[data-view]", this.main).hidden = csv.hidden;
+    $("[data-view]", this.main).classList.toggle("on", this.fit);
     if (cur && cur.columns) {
       const count = cur.truncated ? `${plural(cur.total, "row")}, showing the first ${fmtN(cur.rows.length)}` : plural(cur.rows.length, "row");
       stat.textContent = `${count}  ·  ${res.ms} ms${tags.length ? "  ·  " + tags.join(", ") : ""}`;
       out.innerHTML = errHTML + `<div class="grid-wrap" data-gw></div>`;
       const cols = cur.columns.map((c, k) => {
         const kind = kindFromTypeName(c.type);
-        return { name: c.name, label: c.name, kind, idx: k, type: c.type, readonly: true, width: Math.round(Math.min(340, Math.max(KIND_WIDTH[kind] || 180, c.name.length * 7.4 + 60))) };
+        const col = { name: c.name, label: c.name, kind, idx: k, type: c.type, readonly: true };
+        col.width = columnWidth(col, cur.rows.slice(0, PAGE));
+        return col;
       });
       const src = { count: () => cur.rows.length, get: (r) => cur.rows[r], ensure() {} };
-      this.grid = new Grid($("[data-gw]", out), { source: src, label: "Query result", status: () => `<span><b>${plural(cur.rows.length, "row")}</b></span><span class="muted">Enter shows the full value, ${MOD}+C copies</span>` });
+      this.grid = new Grid($("[data-gw]", out), { source: src, label: "Query result", rh: this.rowHeight, fit: this.fit, status: () => `<span><b>${plural(cur.rows.length, "row")}</b></span><span class="muted">Enter shows the full value, ${MOD}+C copies</span>` });
       this.grid.setCols(cols);
     } else if (!res.error || res.results.length) {
       stat.textContent = `${res.ms} ms`;
@@ -2901,6 +3144,9 @@ function palette() {
   const actions = [
     ...(S.meta.sql !== false ? [{ label: "Open SQL editor", icon: "i-terminal", run: () => (location.hash = "#/sql") }] : []),
     ...THEME_ORDER.filter((t) => t !== themePref()).map((t) => ({ label: t === "system" ? "Theme: follow the system" : `Theme: ${t}`, icon: THEMES[t].icon, run: () => setTheme(t) })),
+    { label: sideShown() ? "Hide sidebar" : "Show sidebar", icon: "i-sidebar", run: () => toggleSide() },
+    { label: S.density === "compact" ? "Density: comfortable" : "Density: compact", icon: "i-grid", run: () => setDensity(S.density === "compact" ? "comfortable" : "compact") },
+    ...(S.view && S.view.toggleFit && S.view.grid ? [{ label: S.view.fit ? "Show columns at saved widths" : "Fit columns to screen", icon: "i-expand", run: () => S.view.toggleFit() }] : []),
     { label: "Reload table list", icon: "i-refresh", run: async () => { await loadTables(); paintTables(); toast("Table list reloaded"); } },
     ...S.meta.databases.filter((d) => d !== S.meta.database).map((d) => ({ label: `Switch to database ${d}`, icon: "i-db", run: () => switchDB(d) })),
     ...(S.meta.fixed ? [] : [{ label: "Sign out", icon: "i-logout", run: signOut }]),
@@ -2941,12 +3187,15 @@ function palette() {
 }
 
 addEventListener("keydown", (e) => {
-  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); palette(); }
+  const mod = e.metaKey || e.ctrlKey, k = e.key.toLowerCase();
+  if (mod && !e.altKey && !e.shiftKey && k === "k") { e.preventDefault(); palette(); }
+  else if (mod && !e.altKey && !e.shiftKey && k === "b" && $(".shell")) { e.preventDefault(); toggleSide(); }
+  else if (mod && !e.altKey && e.shiftKey && k === "f" && S.view && S.view.grid) { e.preventDefault(); toggleFit(); }
 });
 
 // Browser tests (e2e/grid.mjs) set window.__AA_E2E before this script runs
 // to reach internals; a normal page never has it.
-if (E2E) E2E.app = { S, api, prettyJSON, pastedMatrix, saveRecord, closeDrawer, get drawer() { return drawer; }, get lastCopy() { return lastCopy; } };
+if (E2E) E2E.app = { S, api, prettyJSON, pastedMatrix, saveRecord, closeDrawer, toggleSide, setDensity, fitWidths, get drawer() { return drawer; }, get lastCopy() { return lastCopy; } };
 
 boot();
 })();
