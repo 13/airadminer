@@ -24,8 +24,6 @@ import (
 //go:embed web
 var webFS embed.FS
 
-var version = "dev"
-
 type config struct {
 	addr     string
 	dsn      string
@@ -83,7 +81,7 @@ func main() {
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 	if *showVersion {
-		fmt.Println("airadminer", version)
+		fmt.Println(versionLine())
 		return
 	}
 	logger, err := newLogger(cfg.logFormat, os.Stderr)
@@ -133,7 +131,7 @@ func main() {
 	if cfg.tlsCert != "" {
 		scheme = "https"
 	}
-	slog.Info("airadminer listening", "version", version, "url", scheme+"://"+displayAddr(ln.Addr().String()))
+	slog.Info("airadminer listening", "version", version, "commit", commit, "date", date, "url", scheme+"://"+displayAddr(ln.Addr().String()))
 
 	go func() {
 		var err error

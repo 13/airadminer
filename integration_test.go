@@ -651,6 +651,7 @@ func TestIntegrationMetrics(t *testing.T) {
 		`airadminer_logins_total{result="ok"} 1`,
 		"airadminer_sessions 1",
 		`airadminer_db_connections{state="max"} 4`,
+		fmt.Sprintf(`airadminer_build_info{version=%q,commit=%q,date=%q,goversion=%q} 1`, version, commit, date, runtime.Version()),
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("metrics lack %q", want)
@@ -780,6 +781,9 @@ func TestIntegrationNoSQL(t *testing.T) {
 	}
 	if code, _ := c.call("rows", map[string]any{"schema": "public", "name": "t"}); code != 200 {
 		t.Fatalf("plain rows: %d", code)
+	}
+	if _, out := c.call("meta", nil); out["version"] != version || out["commit"] != commit || out["date"] != date {
+		t.Errorf("meta build info = %v %v %v", out["version"], out["commit"], out["date"])
 	}
 	if _, out := c.call("meta", nil); out["sql"] != false {
 		t.Fatalf("meta sql = %v", out["sql"])

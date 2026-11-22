@@ -1309,6 +1309,7 @@ async function renderShell() {
       <div class="side-foot">
         ${S.meta.sql !== false ? `<a class="tbl" href="#/sql" data-sqllink>${icon("i-terminal")}<span class="nm">SQL editor</span></a>` : ""}
         <div class="who" data-who></div>
+        <div class="ver" data-ver></div>
         <div class="row">
           <button class="btn" data-themebtn></button>
           <button class="btn icon" data-logout title="Sign out" ${S.meta.fixed ? "hidden" : ""}>${icon("i-logout")}</button>
@@ -1347,6 +1348,9 @@ function paintSideMeta() {
   $("[data-db] .name").textContent = S.meta.database;
   const host = S.meta.host ? `${S.meta.host}${S.meta.port && S.meta.port !== 5432 ? ":" + S.meta.port : ""}` : "local socket";
   $("[data-who]").innerHTML = `<span title="${esc(S.meta.user + "@" + host)}">${esc(S.meta.user)} on ${esc(host)}</span><span style="flex:none">PG ${esc(String(S.meta.server).split(" ")[0])}</span>`;
+  const built = [S.meta.commit, S.meta.date && String(S.meta.date).slice(0, 10)].filter(Boolean).join(", ");
+  $("[data-ver]").textContent = `airadminer ${S.meta.version}`;
+  $("[data-ver]").title = built ? `airadminer ${S.meta.version} (${built})` : "";
 }
 
 function paintTables() {

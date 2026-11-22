@@ -343,7 +343,7 @@ func (a *App) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	p("airadminer_go_heap_bytes %d", ms.HeapAlloc)
 	p("# HELP airadminer_build_info Version of this binary.")
 	p("# TYPE airadminer_build_info gauge")
-	p(`airadminer_build_info{version=%q} 1`, version)
+	p(`airadminer_build_info{version=%q,commit=%q,date=%q,goversion=%q} 1`, version, commit, date, runtime.Version())
 	_, _ = io.WriteString(w, b.String())
 }
 

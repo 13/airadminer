@@ -1,5 +1,7 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-LDFLAGS := -s -w -X main.version=$(VERSION)
+COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null)$(shell git diff --quiet HEAD 2>/dev/null || echo -dirty)
+DATE ?= $(shell git log -1 --format=%cI 2>/dev/null)
+LDFLAGS := -s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.date=$(DATE)
 PLATFORMS ?= linux/amd64
 
 .PHONY: build run test test-integration e2e fuzz soak lint dist docker clean demo
@@ -58,7 +60,7 @@ demo:
 # Container image as CI builds it (linux/amd64, FROM scratch)
 IMAGE ?= airadminer
 docker:
-	docker build --platform linux/amd64 --build-arg VERSION=$(VERSION) -t $(IMAGE):$(VERSION) -t $(IMAGE):latest .
+	docker build --platform linux/amd64 --build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) --build-arg DATE=$(DATE) -t $(IMAGE):$(VERSION) -t $(IMAGE):latest .
 
 clean:
 	rm -rf airadminer dist

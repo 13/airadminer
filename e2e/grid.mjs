@@ -77,6 +77,14 @@ const helpers = `
 `;
 
 const tests = {
+  async "the sidebar shows the airadminer version"() {
+    return run(`
+      const el = document.querySelector("[data-ver]");
+      if (!el || el.textContent !== "airadminer " + S.meta.version) throw new Error("sidebar shows " + el?.textContent);
+      if (S.meta.commit && !el.title.includes(S.meta.commit)) throw new Error("tooltip lacks the commit: " + el.title);
+    `);
+  },
+
   async "paste reaches rows that were not loaded yet"(sc) {
     return run(`
       await sql("CREATE TABLE ${sc}.items (id int PRIMARY KEY, v text); INSERT INTO ${sc}.items SELECT g, 'orig' FROM generate_series(1, 1000) g");

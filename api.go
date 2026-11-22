@@ -265,7 +265,7 @@ func (a *App) handleLogout(s *Session, db *DB, w http.ResponseWriter, r *http.Re
 func (a *App) handleMeta(s *Session, db *DB, w http.ResponseWriter, r *http.Request) (any, error) {
 	ctx := r.Context()
 	pool := db.pool
-	out := map[string]any{"fixed": s.fixed, "readonly": a.cfg.readonly, "version": version, "sql": !a.cfg.noSQL, "csvEscape": a.cfg.csvEscape}
+	out := map[string]any{"fixed": s.fixed, "readonly": a.cfg.readonly, "version": version, "commit": commit, "date": date, "sql": !a.cfg.noSQL, "csvEscape": a.cfg.csvEscape}
 	var user, dbName, server, host string
 	var ro string
 	err := pool.QueryRow(ctx, `SELECT current_user, current_database(), current_setting('server_version'),

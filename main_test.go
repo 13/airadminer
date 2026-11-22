@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -490,5 +491,18 @@ func TestOuterOrder(t *testing.T) {
 		if got := outerOrder(in); got != want {
 			t.Errorf("%q: got %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestVersionLine(t *testing.T) {
+	v, c, d := version, commit, date
+	defer func() { version, commit, date = v, c, d }()
+	version, commit, date = "v1.2.3", "abc1234", "2026-11-20T10:00:00Z"
+	if got, want := versionLine(), "airadminer v1.2.3 (abc1234, 2026-11-20, "+runtime.Version()+")"; got != want {
+		t.Fatalf("versionLine() = %q, want %q", got, want)
+	}
+	commit, date = "", ""
+	if got, want := versionLine(), "airadminer v1.2.3 ("+runtime.Version()+")"; got != want {
+		t.Fatalf("versionLine() = %q, want %q", got, want)
 	}
 }

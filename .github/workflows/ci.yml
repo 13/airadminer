@@ -67,7 +67,10 @@ jobs:
           fetch-depth: 0   # git describe needs the tags
       - name: version
         id: v
-        run: echo "version=$(git describe --tags --always)" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "version=$(git describe --tags --always)" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "date=$(git log -1 --format=%cI)" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
@@ -84,7 +87,10 @@ jobs:
         with:
           context: .
           platforms: linux/amd64
-          build-args: VERSION=${{ steps.v.outputs.version }}
+          build-args: |
+            VERSION=${{ steps.v.outputs.version }}
+            COMMIT=${{ steps.v.outputs.commit }}
+            DATE=${{ steps.v.outputs.date }}
           load: true
           tags: airadminer:ci
           cache-from: type=gha
@@ -108,7 +114,10 @@ jobs:
         with:
           context: .
           platforms: linux/amd64
-          build-args: VERSION=${{ steps.v.outputs.version }}
+          build-args: |
+            VERSION=${{ steps.v.outputs.version }}
+            COMMIT=${{ steps.v.outputs.commit }}
+            DATE=${{ steps.v.outputs.date }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
