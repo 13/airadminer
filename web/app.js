@@ -1473,11 +1473,7 @@ function route() {
   let next;
   if (parts[0] === "sql" && S.meta.sql !== false) next = { type: "sql" }; // -no-sql: falls through to a table
   else if (parts[0] === "t" && parts[1] && parts[2]) next = { type: "table", schema: parts[1], name: parts[2], tab: parts[3] === "structure" ? "structure" : "grid", view: qi < 0 ? null : parseViewParams(raw.slice(qi + 1)) };
-  else {
-    const first = S.tables.find((t) => t.schema === "public") || S.tables[0];
-    if (first) { location.replace(`#/t/${encodeURIComponent(first.schema)}/${encodeURIComponent(first.name)}`); return; }
-    next = { type: "empty" };
-  }
+  else next = { type: "empty" }; // no table is opened until one is picked
   const v = S.view;
   if (v && next.type === "table" && v instanceof TableView && v.ref.schema === next.schema && v.ref.name === next.name) {
     v.setTab(next.tab);
@@ -1508,7 +1504,7 @@ function bindTopbar(root) {
 function renderEmpty(main) {
   document.title = `${S.meta.database} · airadminer`;
   main.innerHTML = topbar(`<div class="crumb"><h2>${esc(S.meta.database)}</h2></div>`) + `
-    <div class="empty">${icon("k-r")}<h3>This database has no tables yet</h3><p>Tables you create show up in the sidebar.</p>${S.meta.sql !== false ? `<a class="btn primary" href="#/sql">${icon("i-terminal")}Open SQL editor</a>` : ""}</div>`;
+    <div class="empty">${icon("k-r")}${S.tables.length ? `<h3>No table open</h3><p>Pick a table in the sidebar.</p>` : `<h3>This database has no tables yet</h3><p>Tables you create show up in the sidebar.</p>`}${S.meta.sql !== false ? `<a class="btn primary" href="#/sql">${icon("i-terminal")}Open SQL editor</a>` : ""}</div>`;
   bindTopbar(main);
 }
 

@@ -516,7 +516,9 @@ const nosqlTests = {
       if (S.meta.sql !== false) throw new Error("server is not in -no-sql mode");
       if (document.querySelector("[data-sqllink]")) throw new Error("the sidebar links to the SQL editor");
       location.hash = "#/sql";
-      await until(() => S.view && S.view.meta && S.view.rows && S.view.rows.ready, "a table instead of the editor");
+      await until(() => !S.view && document.querySelector(".empty h3"), "the start page instead of the editor");
+      const t = S.tables.find((t) => t.schema === "public") || S.tables[0];
+      await open_(encodeURIComponent(t.schema), encodeURIComponent(t.name));
       document.querySelector("[data-filter]").click();
       await until(() => document.querySelector(".rules.pop"), "filter menu");
       if (document.querySelector("[data-addsql]")) throw new Error("the filter menu offers SQL conditions");
@@ -531,8 +533,7 @@ const nosqlTests = {
 
   async "with -no-sql a link's SQL filter is dropped"() {
     return run(`
-      await until(() => S.view && S.view.meta && S.view.rows && S.view.rows.ready, "a table");
-      const { schema, name } = S.view.meta;
+      const { schema, name } = S.tables.find((t) => t.schema === "public") || S.tables[0];
       location.hash = "#/t/" + encodeURIComponent(schema) + "/" + encodeURIComponent(name) + "?" + new URLSearchParams({ f: JSON.stringify([{ op: "sql", val: "false" }]) });
       await until(() => !location.hash.includes("?f="), "the SQL filter removed from the URL");
       if (S.view.settings.filters.length) throw new Error("filters: " + JSON.stringify(S.view.settings.filters));
