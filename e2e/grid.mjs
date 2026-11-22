@@ -85,6 +85,19 @@ const tests = {
     `);
   },
 
+  async "switching database clears the table search"() {
+    return run(`
+      const find = document.querySelector("[data-find]");
+      find.value = "no_such_table_xyz";
+      find.dispatchEvent(new Event("input"));
+      await until(() => document.querySelector(".side-empty"), "no matches");
+      await __AA_E2E.app.switchDB(S.meta.database);
+      const box = document.querySelector("[data-find]");
+      if (box.value !== "" || S.filterText !== "") throw new Error("search kept: " + JSON.stringify([box.value, S.filterText]));
+      if (S.tables.length && !document.querySelector(".side-list .tbl")) throw new Error("sidebar lists no tables");
+    `);
+  },
+
   async "paste reaches rows that were not loaded yet"(sc) {
     return run(`
       await sql("CREATE TABLE ${sc}.items (id int PRIMARY KEY, v text); INSERT INTO ${sc}.items SELECT g, 'orig' FROM generate_series(1, 1000) g");

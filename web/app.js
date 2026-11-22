@@ -68,6 +68,7 @@ async function dbChanged() {
     S.meta = await api("meta");
     if (S.view && S.view.destroy) S.view.destroy();
     S.view = null;
+    S.filterText = "";
     location.hash = "";
     await renderShell();
     toast(`This session was switched to database ${S.meta.database} in another tab`, { err: true });
@@ -1323,6 +1324,7 @@ async function renderShell() {
   paintSideMeta();
   paintTables();
   const find = $("[data-find]");
+  find.value = S.filterText;
   find.addEventListener("input", () => { S.filterText = find.value; paintTables(); });
   find.addEventListener("keydown", (e) => {
     if (e.key === "Enter") { const a = $(".side-list .tbl"); if (a) { location.hash = a.getAttribute("href"); find.blur(); } }
@@ -1402,6 +1404,7 @@ async function switchDB(db) {
     S.meta = await api("meta");
     if (S.view && S.view.destroy) S.view.destroy();
     S.view = null;
+    S.filterText = "";
     location.hash = "";
     await renderShell();
     toast(`Switched to ${db}`);
@@ -3357,7 +3360,7 @@ addEventListener("keydown", (e) => {
 
 // Browser tests (e2e/grid.mjs) set window.__AA_E2E before this script runs
 // to reach internals; a normal page never has it.
-if (E2E) E2E.app = { S, api, prettyJSON, pastedMatrix, saveRecord, closeDrawer, toggleSide, setDensity, fitWidths, get drawer() { return drawer; }, get lastCopy() { return lastCopy; } };
+if (E2E) E2E.app = { S, api, prettyJSON, pastedMatrix, saveRecord, closeDrawer, switchDB, toggleSide, setDensity, fitWidths, get drawer() { return drawer; }, get lastCopy() { return lastCopy; } };
 
 boot();
 })();
