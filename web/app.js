@@ -1761,8 +1761,8 @@ class TableView {
     const kindName = m.hypertable ? "Hypertable" : { r: "", v: "View", m: "Materialized view", f: "Foreign table", p: "Partitioned" }[m.kind];
     let badge = "";
     if (S.meta.readonly) badge = `<span class="badge warn">Read-only session</span>`;
-    else if (!m.keyMode && m.hypertable) badge = `<span class="badge" title="A compressed hypertable can be edited only with a primary key">Read-only: no primary key</span>`;
-    else if (!m.keyMode) badge = `<span class="badge" title="Rows can be edited only in tables with a primary key">${kindName && m.kind !== "p" ? "Read-only " + kindName.toLowerCase() : "Read-only: no primary key"}</span>`;
+    else if (!m.keyMode && m.hypertable) badge = `<span class="badge" title="A compressed hypertable can be edited only with a primary key or a unique key on not-null columns">Read-only: no primary key</span>`;
+    else if (!m.keyMode) badge = `<span class="badge" title="Rows can be edited only in tables with a primary key or a unique key on not-null columns">${kindName && m.kind !== "p" ? "Read-only " + kindName.toLowerCase() : "Read-only: no primary key"}</span>`;
     else if (kindName) badge = `<span class="badge">${kindName}</span>`;
     const base = `#/t/${encodeURIComponent(m.schema)}/${encodeURIComponent(m.name)}`;
     this.main.innerHTML = topbar(`
@@ -2170,7 +2170,7 @@ class TableView {
 
   columnMenu(col, anchor) {
     const c = col.meta;
-    const tags = [c.pk && "primary key", c.fk && `→ ${c.fk.table}.${c.fk.column}`, !c.nullable && "not null", c.identity && "identity", c.generated && "generated"].filter(Boolean);
+    const tags = [c.pk && (this.meta.keyIndex ? "unique key" : "primary key"), c.fk && `→ ${c.fk.table}.${c.fk.column}`, !c.nullable && "not null", c.identity && "identity", c.generated && "generated"].filter(Boolean);
     const kind = col.kind;
     const [a, z] = kind === "num" ? ["1 → 9", "9 → 1"] : kind === "date" || kind === "datetime" ? ["oldest first", "newest first"] : ["A → Z", "Z → A"];
     const el = html(`<div style="width:250px">
@@ -2627,7 +2627,7 @@ class TableView {
         ${m.kind !== "v" ? `<div><b>Rows (estimate)</b><span>${m.estimate >= 0 ? fmtN(m.estimate) : "not analyzed"}</span></div>` : ""}
         ${m.size != null ? `<div><b>Size on disk</b><span>${fmtBytes(m.size)}</span></div>` : ""}
         <div><b>Fields</b><span>${m.columns.length}</span></div>
-        <div><b>Primary key</b><span>${m.pk.length ? esc(m.pk.join(", ")) : "none"}</span></div>
+        <div><b>${m.keyIndex ? "Row key" : "Primary key"}</b><span>${m.pk.length ? esc(m.pk.join(", ")) + (m.keyIndex ? ` <span class="muted">(unique ${esc(m.keyIndex)})</span>` : "") : "none"}</span></div>
       </div>
       <section><h3>Fields <span class="n">${m.columns.length}</span></h3><div class="tcard"><table class="t"><thead><tr><th>Name</th><th>Type</th><th>Null</th><th>Default</th><th>References</th></tr></thead><tbody>${m.columns.map(col).join("")}</tbody></table></div></section>
       ${m.indexes.length ? `<section><h3>Indexes <span class="n">${m.indexes.length}</span></h3><div class="tcard"><table class="t"><thead><tr><th>Name</th><th>Definition</th><th>Size</th></tr></thead><tbody>${m.indexes.map((i) => `<tr><td>${esc(i.name)}${i.primary ? ` <span class="badge">primary</span>` : i.unique ? ` <span class="badge">unique</span>` : ""}</td><td class="mono">${esc(i.def)}</td><td style="white-space:nowrap">${fmtBytes(i.size)}</td></tr>`).join("")}</tbody></table></div></section>` : ""}
@@ -2830,7 +2830,7 @@ function renderRecord() {
     </div>
     <div class="dr-body">
       ${copy ? `<div class="dr-note">${icon("i-copy", "sm")}<span>Fields start as copies of the original. Change any that must be unique, then create the copy.</span></div>` : ""}
-      ${drawer.fields.map((f, i) => fieldHTML(f, i, blank)).join("")}
+      ${drawer.fields.map((f, i) => fieldHTML(f, i, blank, meta)).join("")}
       ${!isNew && meta.incoming.length ? `<div class="dr-section"><h5>Linked records</h5>${meta.incoming.map((inc, i) => `<button class="linked" data-inc="${i}">${icon("k-r")}<span class="nm">${esc(inc.table)}<small>${esc(inc.column)} = ${esc(row[meta.columns.findIndex((c) => c.name === inc.refColumn) + off] ?? "")}</small></span><span class="n" data-incn="${i}"><span class="spin"></span></span>${icon("i-right", "sm")}</button>`).join("")}</div>` : ""}
     </div>
     ${editable ? `<div class="dr-foot">
@@ -2956,9 +2956,9 @@ function keyFor(meta, row) {
   return k;
 }
 
-function fieldHTML(f, i, isNew) {
+function fieldHTML(f, i, isNew, meta) {
   const c = f.c;
-  const tags = [c.pk && "primary key", !c.nullable && !c.pk && "required", c.identity && "identity", c.generated && "generated"].filter(Boolean);
+  const tags = [c.pk && (meta.keyIndex ? "unique key" : "primary key"), !c.nullable && !c.pk && "required", c.identity && "identity", c.generated && "generated"].filter(Boolean);
   const nullBtn = c.nullable && !f.ro ? `<button class="nullbtn ${f.val === null && !isNew ? "on" : ""}" data-null="${i}" title="Set to null">null</button>` : "";
   const label = `<div class="dr-label">${icon(KIND_ICON[f.kind], "sm")}<span class="name">${esc(c.name)}</span><span class="ty">${esc(c.type)}</span>${tags.map((t) => `<span class="tag">${t}</span>`).join("")}<span class="grow"></span>${nullBtn}</div>`;
   const help = c.comment ? `<div class="help">${esc(c.comment)}</div>` : "";

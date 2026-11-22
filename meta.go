@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
@@ -34,7 +35,9 @@ type Column struct {
 	Comment   *string  `json:"comment"`
 	Enum      []string `json:"enum,omitempty"`
 	FK        *FKRef   `json:"fk,omitempty"`
-	PK        bool     `json:"pk"`
+	// PK marks a column of the row key: the primary key or, without one,
+	// the unique index named by TableMeta.KeyIndex.
+	PK bool `json:"pk"`
 }
 
 type Index struct {
@@ -62,6 +65,9 @@ type TableMeta struct {
 	Columns  []Column `json:"columns"`
 	PK       []string `json:"pk"`
 	KeyMode  string   `json:"keyMode"` // "pk", "ctid" or "" (read-only)
+	// KeyIndex names the unique index that serves as the row key when the
+	// table has no primary key; PK then lists its columns.
+	KeyIndex string `json:"keyIndex,omitempty"`
 	// Inherited is set when other tables inherit from this one, such as
 	// the chunks of a TimescaleDB hypertable. A scan of the parent then
 	// returns their rows too, and ctid (and even ctid with xmin) can repeat
@@ -264,16 +270,27 @@ func loadMeta(ctx context.Context, q querier, schema, name string) (*TableMeta, 
 	if m.PK, err = pgx.CollectRows(rows, pgx.RowTo[string]); err != nil {
 		return nil, err
 	}
-	for _, p := range m.PK {
-		if c := m.column(p); c != nil {
-			c.PK = true
-		}
-	}
 	compressed := false
 	if m.Kind == "r" && m.Inherited {
 		if h, ok := hypertables(ctx, q, m.OID)[m.OID]; ok {
 			size := h.size
 			m.Size, m.Estimate, m.Hypertable, compressed = &size, h.rows, true, h.compressed
+		}
+	}
+	// Without a primary key, a unique index on not-null columns names each
+	// row just as well. It must be plain (no expressions, no predicate),
+	// valid and checked at once. A unique index on a plain inheritance
+	// parent does not cover its children, so only hypertables (whose
+	// unique indexes hold the time column and span all chunks) and
+	// partitioned tables qualify among tables with children.
+	if len(m.PK) == 0 && (m.Kind == "p" || (m.Kind == "r" && (!m.Inherited || m.Hypertable))) {
+		if m.KeyIndex, m.PK, err = uniqueKey(ctx, q, m.OID); err != nil {
+			return nil, err
+		}
+	}
+	for _, p := range m.PK {
+		if c := m.column(p); c != nil {
+			c.PK = true
 		}
 	}
 	switch {
@@ -380,4 +397,29 @@ func loadMeta(ctx context.Context, q querier, schema, name string) (*TableMeta, 
 		m.Columns = []Column{}
 	}
 	return m, nil
+}
+
+// uniqueKey returns the unique index that can stand in for a missing
+// primary key, and its key columns in order: the one with the fewest
+// columns, then by name. It returns "" when there is none.
+func uniqueKey(ctx context.Context, q querier, oid uint32) (string, []string, error) {
+	var name string
+	var cols []string
+	err := q.QueryRow(ctx, `
+		SELECT ic.relname,
+		       ARRAY(SELECT a.attname FROM unnest(i.indkey::int2[]) WITH ORDINALITY k(n, o)
+		             JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.n
+		             WHERE k.o <= i.indnkeyatts ORDER BY k.o)
+		FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid
+		WHERE i.indrelid = $1 AND i.indisunique AND i.indisvalid AND i.indimmediate
+		  AND i.indpred IS NULL AND i.indexprs IS NULL
+		  AND NOT EXISTS (
+		      SELECT 1 FROM unnest(i.indkey::int2[]) WITH ORDINALITY k(n, o)
+		      LEFT JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.n
+		      WHERE k.o <= i.indnkeyatts AND (k.n = 0 OR NOT a.attnotnull))
+		ORDER BY i.indnkeyatts, ic.relname LIMIT 1`, oid).Scan(&name, &cols)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil, nil
+	}
+	return name, cols, err
 }

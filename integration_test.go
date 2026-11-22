@@ -968,6 +968,41 @@ func TestIntegrationInheritedCtidKeys(t *testing.T) {
 	inheritedKeysWork(t, c, ref, 2)
 }
 
+// A unique index on not-null columns stands in for a missing primary key;
+// nullable, partial and expression indexes do not.
+func TestIntegrationUniqueIndexKey(t *testing.T) {
+	db := testDB(t, `CREATE TABLE u (b int NOT NULL, a text NOT NULL, v text, UNIQUE (a, b));
+		CREATE UNIQUE INDEX u_v ON u (v);
+		INSERT INTO u VALUES (1, 'x', 'one'), (2, 'x', 'two');
+		CREATE TABLE n (a int UNIQUE, v text);
+		CREATE TABLE w (a int NOT NULL, v text);
+		CREATE UNIQUE INDEX w_a ON w (a) WHERE a > 0;
+		CREATE UNIQUE INDEX w_e ON w ((a + 1));
+		CREATE TABLE p (a int NOT NULL UNIQUE);
+		CREATE TABLE c1 () INHERITS (p);`)
+	a := newApp(config{addr: "127.0.0.1:0"})
+	defer a.closeAll()
+	c := signIn(t, a, db)
+	_, m := c.call("table", map[string]any{"schema": "public", "name": "u"})
+	if m["keyMode"] != "pk" || m["keyIndex"] != "u_a_b_key" || fmt.Sprint(m["pk"]) != "[a b]" {
+		t.Fatalf("u: keyMode %v keyIndex %v pk %v", m["keyMode"], m["keyIndex"], m["pk"])
+	}
+	code, res := c.call("update", map[string]any{"schema": "public", "name": "u", "key": map[string]any{"a": "x", "b": "2"}, "values": map[string]any{"v": "changed"}})
+	if code != 200 {
+		t.Fatalf("update: %d %v", code, res)
+	}
+	_, out := c.call("rows", map[string]any{"schema": "public", "name": "u", "limit": 10})
+	if got := fmt.Sprint(out["rows"]); got != "[[1 x one] [2 x changed]]" {
+		t.Fatalf("rows after update: %s", got)
+	}
+	for _, name := range []string{"n", "w", "p"} {
+		_, m := c.call("table", map[string]any{"schema": "public", "name": name})
+		if m["keyMode"] != "ctid" || m["keyIndex"] != nil {
+			t.Errorf("%s: keyMode %v keyIndex %v", name, m["keyMode"], m["keyIndex"])
+		}
+	}
+}
+
 // inheritedKeysWork checks a ctid-keyed table with children of n rows:
 // keyset paging sees each row once, and an update changes one row only.
 func inheritedKeysWork(t *testing.T, c *client, ref map[string]any, n int) {
@@ -1047,6 +1082,11 @@ func TestIntegrationTimescaleHypertable(t *testing.T) {
 		INSERT INTO z SELECT '2026-01-01'::timestamptz + i * interval '1 hour', i::text FROM generate_series(0, 71) i;
 		ALTER TABLE z SET (timescaledb.compress);
 		SELECT compress_chunk(c) FROM show_chunks('z') c;
+		CREATE TABLE k (t timestamptz NOT NULL, d text NOT NULL, v text, UNIQUE (t, d));
+		SELECT create_hypertable('k', 't', chunk_time_interval => interval '1 day');
+		INSERT INTO k SELECT '2026-01-01'::timestamptz + i * interval '1 hour', 'd', i::text FROM generate_series(0, 71) i;
+		ALTER TABLE k SET (timescaledb.compress, timescaledb.compress_segmentby = 'd');
+		SELECT compress_chunk(c) FROM show_chunks('k') c;
 		ANALYZE;`); err != nil {
 		t.Fatal(err)
 	}
@@ -1087,6 +1127,21 @@ func TestIntegrationTimescaleHypertable(t *testing.T) {
 	}
 	if code, out := c.call("rows", map[string]any{"schema": "public", "name": "z", "limit": 100}); code != 200 || len(out["rows"].([]any)) != 72 {
 		t.Fatalf("rows of compressed hypertable: %d %v", code, out)
+	}
+
+	// With a unique key on not-null columns, a compressed hypertable is
+	// edited by that key.
+	ref = map[string]any{"schema": "public", "name": "k"}
+	if _, m := c.call("table", ref); m["keyMode"] != "pk" || m["keyIndex"] == nil {
+		t.Fatalf("keyed compressed hypertable meta: keyMode %v keyIndex %v", m["keyMode"], m["keyIndex"])
+	}
+	key := map[string]any{"t": "2026-01-02T05:00:00Z", "d": "d"}
+	if code, res := c.call("update", map[string]any{"schema": "public", "name": "k", "key": key, "values": map[string]any{"v": "changed"}}); code != 200 {
+		t.Fatalf("update compressed hypertable: %d %v", code, res)
+	}
+	var v string
+	if err := conn.QueryRow(context.Background(), "SELECT string_agg(v, ',') FROM k WHERE v = 'changed' OR t = '2026-01-02T05:00:00Z'").Scan(&v); err != nil || v != "changed" {
+		t.Fatalf("after update: %q %v", v, err)
 	}
 }
 
