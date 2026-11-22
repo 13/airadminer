@@ -9,6 +9,8 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 const ESC = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ESC[c]);
+// qid quotes a PostgreSQL identifier unless it is plain lower case.
+const qid = (s) => (/^[a-z_][a-z0-9_$]*$/.test(s) ? s : `"${s.replace(/"/g, `""`)}"`);
 const icon = (id, cls = "") => `<svg class="i ${cls}" aria-hidden="true"><use href="#${id}"/></svg>`;
 const isMac = /Mac|iPhone|iPad/.test(navigator.platform);
 const MOD = isMac ? "⌘" : "Ctrl";
@@ -1761,7 +1763,11 @@ class TableView {
     const kindName = m.hypertable ? "Hypertable" : { r: "", v: "View", m: "Materialized view", f: "Foreign table", p: "Partitioned" }[m.kind];
     let badge = "";
     if (S.meta.readonly) badge = `<span class="badge warn">Read-only session</span>`;
-    else if (!m.keyMode && m.hypertable) badge = `<span class="badge" title="A compressed hypertable can be edited only with a primary key or a unique key on not-null columns">Read-only: no primary key</span>`;
+    else if (!m.keyMode && m.hypertable) {
+      const dims = (m.dimensions || []).map((d) => qid(d)).join(", ") || "…";
+      const tip = `A compressed hypertable can be edited only with a primary key or a unique key on not-null columns, which must include ${dims}. For example:\nALTER TABLE ${qid(m.schema)}.${qid(m.name)} ADD UNIQUE (${dims});`;
+      badge = `<span class="badge" title="${esc(tip)}">Read-only: no primary key</span>`;
+    }
     else if (!m.keyMode) badge = `<span class="badge" title="Rows can be edited only in tables with a primary key or a unique key on not-null columns">${kindName && m.kind !== "p" ? "Read-only " + kindName.toLowerCase() : "Read-only: no primary key"}</span>`;
     else if (kindName) badge = `<span class="badge">${kindName}</span>`;
     const base = `#/t/${encodeURIComponent(m.schema)}/${encodeURIComponent(m.name)}`;
@@ -2627,7 +2633,7 @@ class TableView {
         ${m.kind !== "v" ? `<div><b>Rows (estimate)</b><span>${m.estimate >= 0 ? fmtN(m.estimate) : "not analyzed"}</span></div>` : ""}
         ${m.size != null ? `<div><b>Size on disk</b><span>${fmtBytes(m.size)}</span></div>` : ""}
         <div><b>Fields</b><span>${m.columns.length}</span></div>
-        <div><b>${m.keyIndex ? "Row key" : "Primary key"}</b><span>${m.pk.length ? esc(m.pk.join(", ")) + (m.keyIndex ? ` <span class="muted">(unique ${esc(m.keyIndex)})</span>` : "") : "none"}</span></div>
+        <div><b>${m.keyIndex ? "Row key" : "Primary key"}</b><span>${m.pk.length ? esc(m.pk.join(", ")) + (m.keyIndex ? ` <span class="muted">(index ${esc(m.keyIndex)})</span>` : "") : "none"}</span></div>
       </div>
       <section><h3>Fields <span class="n">${m.columns.length}</span></h3><div class="tcard"><table class="t"><thead><tr><th>Name</th><th>Type</th><th>Null</th><th>Default</th><th>References</th></tr></thead><tbody>${m.columns.map(col).join("")}</tbody></table></div></section>
       ${m.indexes.length ? `<section><h3>Indexes <span class="n">${m.indexes.length}</span></h3><div class="tcard"><table class="t"><thead><tr><th>Name</th><th>Definition</th><th>Size</th></tr></thead><tbody>${m.indexes.map((i) => `<tr><td>${esc(i.name)}${i.primary ? ` <span class="badge">primary</span>` : i.unique ? ` <span class="badge">unique</span>` : ""}</td><td class="mono">${esc(i.def)}</td><td style="white-space:nowrap">${fmtBytes(i.size)}</td></tr>`).join("")}</tbody></table></div></section>` : ""}

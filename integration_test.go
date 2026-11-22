@@ -1143,6 +1143,29 @@ func TestIntegrationTimescaleHypertable(t *testing.T) {
 	if err := conn.QueryRow(context.Background(), "SELECT string_agg(v, ',') FROM k WHERE v = 'changed' OR t = '2026-01-02T05:00:00Z'").Scan(&v); err != nil || v != "changed" {
 		t.Fatalf("after update: %q %v", v, err)
 	}
+
+	// A new time can belong in another chunk: the row moves there, keeping
+	// its other values, and only if it still holds what the user saw.
+	move := map[string]any{"schema": "public", "name": "k", "key": key, "values": map[string]any{"t": "2026-03-01T00:00:00Z"}}
+	move["expect"] = map[string]any{"v": "stale"}
+	if code, _ := c.call("update", move); code == 200 {
+		t.Fatal("move with a stale expectation succeeded")
+	}
+	move["expect"] = map[string]any{"v": "changed"}
+	if code, res := c.call("update", move); code != 200 {
+		t.Fatalf("move to another chunk: %d %v", code, res)
+	}
+	var n int
+	if err := conn.QueryRow(context.Background(), "SELECT count(*) FROM k").Scan(&n); err != nil || n != 72 {
+		t.Fatalf("rows after move: %d %v", n, err)
+	}
+	if err := conn.QueryRow(context.Background(), "SELECT string_agg(v, ',') FROM k WHERE t = '2026-03-01T00:00:00Z' OR t = '2026-01-02T05:00:00Z'").Scan(&v); err != nil || v != "changed" {
+		t.Fatalf("after move: %q %v", v, err)
+	}
+	code, res := c.call("update", map[string]any{"schema": "public", "name": "k", "key": map[string]any{"t": "2026-03-01T00:00:00Z", "d": "d"}, "values": map[string]any{"t": "2026-01-01T01:00:00Z"}})
+	if code == 200 || !strings.Contains(fmt.Sprint(res), "duplicate key") {
+		t.Fatalf("move onto an existing key: %d %v", code, res)
+	}
 }
 
 func TestIntegrationFilterValues(t *testing.T) {

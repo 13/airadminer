@@ -963,9 +963,11 @@ func updateSQL(m *TableMeta, key rowKey, values, expect map[string]*string) (stm
 	}
 	args := &sqlArgs{}
 	var sets []string
+	ph := map[string]string{}     // new value's placeholder by column
 	for _, c := range m.Columns { // column order keeps the SQL deterministic
 		if v, ok := values[c.Name]; ok {
-			sets = append(sets, ident(c.Name)+" = "+args.add(v))
+			ph[c.Name] = args.add(v)
+			sets = append(sets, ident(c.Name)+" = "+ph[c.Name])
 		}
 	}
 	if len(sets) != len(values) {
@@ -993,7 +995,47 @@ func updateSQL(m *TableMeta, key rowKey, values, expect map[string]*string) (stm
 			return stmt{}, errors.New("unknown column in update")
 		}
 	}
-	return stmt{"UPDATE " + ident(m.Schema, m.Name) + " SET " + strings.Join(sets, ", ") + " WHERE " + where + " RETURNING " + selectList(m, false), args.vals}, nil
+	t := ident(m.Schema, m.Name)
+	if moves(m, values) {
+		// TimescaleDB keeps an updated row in its chunk, and the chunk's
+		// check constraint refuses a value that belongs in another one.
+		// Delete and insert instead, as PostgreSQL itself moves a row
+		// between partitions. Generated columns are computed again.
+		var cols, exprs []string
+		for _, c := range m.Columns {
+			if c.Generated != "" {
+				continue
+			}
+			cols = append(cols, ident(c.Name))
+			if p, ok := ph[c.Name]; ok {
+				exprs = append(exprs, p+"::"+c.Type)
+			} else {
+				exprs = append(exprs, `"__aa_old".`+ident(c.Name))
+			}
+		}
+		over := ""
+		for _, c := range m.Columns {
+			if c.Identity == "a" {
+				over = " OVERRIDING SYSTEM VALUE"
+			}
+		}
+		return stmt{`WITH "__aa_old" AS (DELETE FROM ` + t + " WHERE " + where + " RETURNING *) INSERT INTO " + t + " (" + strings.Join(cols, ", ") + ")" + over +
+			" SELECT " + strings.Join(exprs, ", ") + ` FROM "__aa_old" RETURNING ` + selectList(m, false), args.vals}, nil
+	}
+	return stmt{"UPDATE " + t + " SET " + strings.Join(sets, ", ") + " WHERE " + where + " RETURNING " + selectList(m, false), args.vals}, nil
+}
+
+// moves reports an update that sets a partitioning column of a hypertable.
+func moves(m *TableMeta, values map[string]*string) bool {
+	if m.KeyMode != "pk" {
+		return false
+	}
+	for _, d := range m.Dimensions {
+		if _, ok := values[d]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func insertSQL(m *TableMeta, values map[string]*string) (stmt, error) {

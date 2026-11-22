@@ -72,8 +72,12 @@ type TableMeta struct {
 	// the chunks of a TimescaleDB hypertable. A scan of the parent then
 	// returns their rows too, and ctid (and even ctid with xmin) can repeat
 	// across them, so ctid keys also carry the tableoid.
-	Inherited   bool         `json:"-"`
-	Hypertable  bool         `json:"hypertable,omitempty"`
+	Inherited  bool `json:"-"`
+	Hypertable bool `json:"hypertable,omitempty"`
+	// Dimensions are the partitioning columns of a hypertable. A row whose
+	// value in one of them changes may belong in another chunk, which
+	// TimescaleDB does not move it to, so such updates delete and insert.
+	Dimensions  []string     `json:"dimensions,omitempty"`
 	Indexes     []Index      `json:"indexes"`
 	Constraints []Constraint `json:"constraints"`
 	Incoming    []Incoming   `json:"incoming"`
@@ -275,6 +279,14 @@ func loadMeta(ctx context.Context, q querier, schema, name string) (*TableMeta, 
 		if h, ok := hypertables(ctx, q, m.OID)[m.OID]; ok {
 			size := h.size
 			m.Size, m.Estimate, m.Hypertable, compressed = &size, h.rows, true, h.compressed
+			rows, err := q.Query(ctx, `SELECT column_name::text FROM timescaledb_information.dimensions
+				WHERE hypertable_schema = $1 AND hypertable_name = $2 ORDER BY dimension_number`, m.Schema, m.Name)
+			if err != nil {
+				return nil, err
+			}
+			if m.Dimensions, err = pgx.CollectRows(rows, pgx.RowTo[string]); err != nil {
+				return nil, err
+			}
 		}
 	}
 	// Without a primary key, a unique index on not-null columns names each
