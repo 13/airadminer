@@ -1085,3 +1085,67 @@ func TestIntegrationTimescaleHypertable(t *testing.T) {
 		t.Fatalf("rows of compressed hypertable: %d %v", code, out)
 	}
 }
+
+func TestIntegrationFilterValues(t *testing.T) {
+	db := testDB(t, `CREATE TABLE small (id int, loc text, n int);
+		INSERT INTO small VALUES (1, 'Tallinn', 1), (2, 'Tartu', 2), (3, 'Tallinn', 3), (4, NULL, 4), (5, repeat('x', 300), 5), (6, 'Pärnu', 6),
+			(7, '', 7), (8, '', 8), (9, E'two\nlines', 9), (10, E'two\nlines', 10);
+		CREATE TABLE part (loc text, d int) PARTITION BY RANGE (d);
+		CREATE TABLE part1 PARTITION OF part FOR VALUES FROM (0) TO (100000);
+		CREATE TABLE part2 PARTITION OF part FOR VALUES FROM (100000) TO (300000);
+		INSERT INTO part SELECT CASE WHEN i < 100000 THEN 'Tartu' WHEN i % 4 = 0 THEN 'Narva' ELSE 'Tallinn' END, i FROM generate_series(1, 299999) i;
+		ANALYZE part1; ANALYZE part2;
+		CREATE VIEW slow AS SELECT loc FROM small WHERE pg_sleep(0.2) IS NOT NULL;
+		CREATE TABLE big (loc text);
+		INSERT INTO big SELECT (ARRAY['Tallinn', 'Tartu', 'Narva'])[1 + i % 3 + (i % 7 = 0)::int % 3] FROM generate_series(1, 250000) i;
+		ANALYZE big;`)
+	a := newApp(config{addr: "127.0.0.1:0"})
+	defer a.closeAll()
+	c := signIn(t, a, db)
+	values := func(name, col, q string) []any {
+		t.Helper()
+		code, out := c.call("values", map[string]any{"schema": "public", "name": name, "col": col, "q": q})
+		if code != 200 {
+			t.Fatalf("values %s.%s %q: %d %v", name, col, q, code, out)
+		}
+		return out["values"].([]any)
+	}
+	// Small table: exact, most frequent first, no nulls or long values.
+	if got := fmt.Sprint(values("small", "loc", "")); got != "[Tallinn Pärnu Tartu]" {
+		t.Errorf("small all = %s", got)
+	}
+	if got := fmt.Sprint(values("small", "loc", "ta")); got != "[Tallinn Tartu]" {
+		t.Errorf("small ta = %s", got)
+	}
+	if got := fmt.Sprint(values("small", "loc", "%")); got != "[]" {
+		t.Errorf("small %% = %s", got)
+	}
+	if got := fmt.Sprint(values("small", "n", "")); got != "[]" {
+		t.Errorf("non-text column = %s", got)
+	}
+	// Big table: read from pg_stats.
+	got := values("big", "loc", "")
+	if len(got) != 3 {
+		t.Errorf("big all = %v", got)
+	}
+	if got := fmt.Sprint(values("big", "loc", "NAR")); got != "[Narva]" {
+		t.Errorf("big NAR = %s", got)
+	}
+	// Partitioned table: the parent is never analyzed, so the partitions'
+	// lists are merged by size: Tallinn 150k, Tartu 100k, Narva 50k.
+	if got := fmt.Sprint(values("part", "loc", "")); got != "[Tallinn Tartu Narva]" {
+		t.Errorf("partitioned = %s", got)
+	}
+	// A view has no stats; the exact query times out once, then is skipped.
+	if got := fmt.Sprint(values("slow", "loc", "")); got != "[]" {
+		t.Errorf("slow view = %s", got)
+	}
+	start := time.Now()
+	values("slow", "loc", "t")
+	if d := time.Since(start); d > 300*time.Millisecond {
+		t.Errorf("timed-out column queried again (%v)", d)
+	}
+	if code, _ := c.call("values", map[string]any{"schema": "public", "name": "small", "col": "nope"}); code == 200 {
+		t.Error("unknown column accepted")
+	}
+}

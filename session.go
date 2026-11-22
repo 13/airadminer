@@ -33,6 +33,9 @@ type DB struct {
 	metaMu    sync.Mutex
 	metaCache map[string]*TableMeta // schema + "\x00" + name -> meta
 	typeNames map[uint32]string
+	// slowValues: columns whose exact value query timed out, by
+	// table oid + "\x00" + column, with when it did.
+	slowValues map[string]time.Time
 
 	// long holds one token per running SQL-editor query or CSV export. It
 	// has one slot fewer than the pool, so browsing and saving always find

@@ -61,6 +61,7 @@ func (a *App) registerAPI(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/table", a.guard(a.authed(a.handleTable)))
 	mux.HandleFunc("POST /api/rows", a.guard(a.authed(a.handleRows)))
 	mux.HandleFunc("POST /api/count", a.guard(a.authed(a.handleCount)))
+	mux.HandleFunc("POST /api/values", a.guard(a.authed(a.handleValues)))
 	mux.HandleFunc("POST /api/cells", a.guard(a.authed(a.handleCells)))
 	mux.HandleFunc("POST /api/update", a.guard(a.authed(a.handleUpdate)))
 	mux.HandleFunc("POST /api/insert", a.guard(a.authed(a.handleInsert)))
@@ -739,6 +740,129 @@ func (a *App) handleCount(s *Session, db *DB, w http.ResponseWriter, r *http.Req
 	}
 	n, _ := strconv.ParseInt(*res.rows[0][0].(*string), 10, 64)
 	return map[string]any{"count": n, "exact": true}, nil
+}
+
+const (
+	valuesMax     = 20
+	valuesLenMax  = 200                    // longer values are not offered
+	valuesScanMax = 200_000                // above this estimate, only pg_stats is read
+	valuesTimeout = 800 * time.Millisecond // for the exact query
+	valuesSlowFor = 10 * time.Minute       // skip the exact query this long after it timed out
+)
+
+type valuesReq struct {
+	tableRef
+	Col string `json:"col"`
+	Q   string `json:"q"`
+}
+
+// valueOK keeps the values a filter can take: an empty one turns the filter
+// off, and the value box cannot hold a line break.
+func valueOK(expr string) string {
+	return expr + " ILIKE $1 AND " + expr + " <> '' AND length(" + expr + ") <= " + strconv.Itoa(valuesLenMax) +
+		" AND strpos(" + expr + ", chr(10)) = 0 AND strpos(" + expr + ", chr(13)) = 0"
+}
+
+// valuesStats reads the planner's most common values, most frequent first.
+// A partitioned table or a hypertable is never analyzed as a whole by
+// autovacuum, so without stats of its own the lists of its descendants are
+// merged, weighted by their size. ok is false when there are no stats at all.
+const valuesStats = `WITH RECURSIVE
+	own AS (
+		SELECT most_common_vals, most_common_freqs FROM pg_stats
+		WHERE schemaname = $2 AND tablename = $3 AND attname = $4
+		ORDER BY inherited DESC LIMIT 1),
+	tree AS (
+		SELECT inhrelid AS oid FROM pg_inherits WHERE inhparent = $5::oid AND NOT EXISTS (SELECT FROM own)
+		UNION SELECT i.inhrelid FROM pg_inherits i JOIN tree ON i.inhparent = tree.oid),
+	src AS (
+		SELECT most_common_vals, most_common_freqs, 1::float8 AS n FROM own
+		UNION ALL
+		SELECT st.most_common_vals, st.most_common_freqs, greatest(c.reltuples, 1)::float8
+		FROM tree JOIN pg_class c ON c.oid = tree.oid JOIN pg_namespace ns ON ns.oid = c.relnamespace
+		JOIN pg_stats st ON st.schemaname = ns.nspname AND st.tablename = c.relname AND st.attname = $4 AND NOT st.inherited),
+	vals AS (
+		SELECT u.v, sum(u.f * src.n) AS w
+		FROM src, unnest(src.most_common_vals::text::text[], src.most_common_freqs) AS u(v, f)
+		WHERE ` + "%s" + `
+		GROUP BY u.v ORDER BY w DESC, u.v LIMIT %d)
+SELECT EXISTS (SELECT FROM src), coalesce((SELECT json_agg(v ORDER BY w DESC, v) FROM vals), '[]')`
+
+// handleValues suggests values for a filter on a text column, most frequent
+// first. A table known to be small is read exactly. Anything else would need
+// a full scan per keystroke, so it gets the planner's most common values,
+// which cost nothing to read; only without any stats is the exact query
+// tried, and a column where it timed out is not tried again for a while.
+func (a *App) handleValues(s *Session, db *DB, w http.ResponseWriter, r *http.Request) (any, error) {
+	var req valuesReq
+	if err := decode(r, &req); err != nil {
+		return nil, err
+	}
+	ctx := r.Context()
+	m, err := db.tableMeta(ctx, req.Schema, req.Name, false)
+	if err != nil {
+		return nil, err
+	}
+	c := m.column(req.Col)
+	if c == nil {
+		return nil, fmt.Errorf("unknown column %q", req.Col)
+	}
+	none := map[string]any{"values": []string{}}
+	if c.Cat != "S" {
+		return none, nil
+	}
+	like := []byte("%" + likeEscape(req.Q) + "%")
+	small := m.Estimate >= 0 && m.Estimate <= valuesScanMax && (m.Kind == "r" || m.Kind == "m")
+	if !small {
+		res, err := db.execText(ctx, fmt.Sprintf(valuesStats, valueOK("u.v"), valuesMax),
+			[][]byte{like, []byte(m.Schema), []byte(m.Name), []byte(c.Name), []byte(strconv.FormatUint(uint64(m.OID), 10))}, false)
+		if err != nil {
+			return nil, err
+		}
+		if *res.rows[0][0].(*string) == "t" {
+			values := []string{}
+			if err := json.Unmarshal([]byte(*res.rows[0][1].(*string)), &values); err != nil {
+				return nil, err
+			}
+			return map[string]any{"values": values}, nil
+		}
+	}
+	key := strconv.FormatUint(uint64(m.OID), 10) + "\x00" + c.Name
+	db.metaMu.Lock()
+	slow := time.Since(db.slowValues[key]) < valuesSlowFor
+	db.metaMu.Unlock()
+	if slow {
+		return none, nil
+	}
+	col := ident(c.Name) + "::text"
+	tctx, cancel := context.WithTimeout(ctx, valuesTimeout)
+	defer cancel()
+	res, err := db.execText(tctx, "SELECT "+col+" FROM "+ident(m.Schema, m.Name)+" WHERE "+valueOK(col)+
+		" GROUP BY 1 ORDER BY count(*) DESC, 1 LIMIT "+strconv.Itoa(valuesMax), [][]byte{like}, false)
+	if err != nil {
+		if ctx.Err() == nil && errors.Is(tctx.Err(), context.DeadlineExceeded) {
+			db.metaMu.Lock()
+			if db.slowValues == nil {
+				db.slowValues = map[string]time.Time{}
+			}
+			db.slowValues[key] = time.Now()
+			db.metaMu.Unlock()
+			return none, nil
+		}
+		return nil, err
+	}
+	return map[string]any{"values": textColumn(res)}, nil
+}
+
+// textColumn returns the first column of a result, skipping nulls.
+func textColumn(res *textResult) []string {
+	out := []string{}
+	for _, row := range res.rows {
+		if v, ok := row[0].(*string); ok && v != nil {
+			out = append(out, *v)
+		}
+	}
+	return out
 }
 
 // ---------- editing ----------

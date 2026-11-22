@@ -1993,6 +1993,9 @@ class TableView {
     const el = html(`<div class="rules"></div>`);
     const cols = this.meta.columns;
     const apply = debounce(() => this.applyView(), 350);
+    // Suggested values for text fields. A native <datalist> popup is drawn
+    // by the browser and ignores the app's styles, so the menu draws its own.
+    const sl = html(`<div class="sug" hidden></div>`);
     const paint = () => {
       const fs = this.settings.filters;
       el.innerHTML = (fs.length ? fs.map((f, i) => {
@@ -2006,7 +2009,7 @@ class TableView {
         if (!NO_VALUE.has(f.op)) {
           val = col.enum
             ? `<select class="select" data-i="${i}" data-k="val"><option value="">Choose…</option>${col.enum.map((x) => `<option ${x === f.val ? "selected" : ""}>${esc(x)}</option>`).join("")}</select>`
-            : `<input class="input" data-i="${i}" data-k="val" value="${esc(f.val || "")}" placeholder="${kind === "datetime" || kind === "date" ? "2025-01-31" : "Value"}" spellcheck="false">`;
+            : `<input class="input" data-i="${i}" data-k="val" value="${esc(f.val || "")}" placeholder="${kind === "datetime" || kind === "date" ? "2025-01-31" : "Value"}" spellcheck="false"${kind === "text" ? ` data-sug autocomplete="off"` : ""}>`;
         }
         return `<div class="rule">${lbl}
           <select class="select" data-i="${i}" data-k="col">${cols.map((c) => `<option ${c.name === col.name ? "selected" : ""} value="${esc(c.name)}">${esc(c.name)}</option>`).join("")}</select>
@@ -2014,17 +2017,78 @@ class TableView {
           ${val || "<span></span>"}${rm}</div>`;
       }).join("") : `<div class="none">No filters yet. Add a condition to narrow the rows.</div>`) +
       `<div class="foot"><span><button class="btn" data-add>${icon("i-plus", "sm")}Add condition</button>${S.meta.sql !== false ? `<button class="btn" data-addsql>${icon("i-terminal", "sm")}Add SQL condition</button>` : ""}</span>${fs.length ? `<button class="btn" data-clearall>Clear all</button>` : ""}</div>`;
+      el.appendChild(sl);
+      sl.hidden = true;
       curPop && curPop.place();
     };
     paint();
     openPop(anchor, el);
     const focusRule = () => { const ins = $$("input[data-k=val], select[data-k=val]", el); (ins[ins.length - 1] || null)?.focus(); };
+    // Suggestions are kept while the menu is open.
+    // A newer request cancels the one before, which frees its connection.
+    const known = new Map();
+    let seq = 0, ctl = null, sugFor = null, items = [], hi = -1;
+    const hideSug = () => { sl.hidden = true; sugFor = null; items = []; hi = -1; };
+    const paintSug = () => {
+      sl.innerHTML = items.map((v, i) => `<button class="mi ${i === hi ? "hi" : ""}" data-s="${i}" tabindex="-1">${esc(v)}</button>`).join("");
+      sl.querySelector(".hi")?.scrollIntoView({ block: "nearest" });
+    };
+    const showSug = (input, vals) => {
+      items = vals; hi = -1; sugFor = input;
+      if (!items.length) { sl.hidden = true; return; }
+      paintSug();
+      // Offsets from the menu box, which is the list's containing block.
+      const pr = el.getBoundingClientRect(), r = input.getBoundingClientRect();
+      sl.style.left = r.left - pr.left - el.clientLeft + "px";
+      sl.style.top = r.bottom - pr.top - el.clientTop + 4 + "px";
+      sl.style.width = r.width + "px";
+      sl.hidden = false;
+    };
+    const pick = (input, v) => {
+      input.value = v;
+      this.settings.filters[+input.dataset.i].val = v;
+      hideSug(); apply();
+    };
+    const suggest = async (input) => {
+      const f = this.settings.filters[+input.dataset.i];
+      if (!f) return;
+      const key = f.col + "\0" + input.value, my = ++seq;
+      if (!known.has(key)) {
+        ctl?.abort();
+        ctl = new AbortController();
+        known.set(key, api("values", { ...this.ref, col: f.col, q: input.value }, { signal: ctl.signal }).then((r) => r.values, () => (known.delete(key), [])));
+      }
+      const vals = await known.get(key);
+      if (my !== seq || !input.isConnected || document.activeElement !== input) return;
+      showSug(input, vals.filter((v) => v !== input.value));
+    };
+    const suggestSoon = debounce(suggest, 200);
+    el.addEventListener("focusin", (e) => { if (e.target.dataset?.sug !== undefined) suggest(e.target); });
+    el.addEventListener("focusout", (e) => { if (e.target === sugFor) { seq++; hideSug(); } });
+    sl.addEventListener("mousedown", (e) => {
+      const b = e.target.closest("[data-s]");
+      e.preventDefault();
+      if (b && sugFor) pick(sugFor, items[+b.dataset.s]);
+    });
+    el.addEventListener("keydown", (e) => {
+      if (sl.hidden || e.target !== sugFor) return;
+      if (e.key === "ArrowDown") { e.preventDefault(); hi = Math.min(items.length - 1, hi + 1); paintSug(); }
+      else if (e.key === "ArrowUp") { e.preventDefault(); hi = Math.max(-1, hi - 1); paintSug(); }
+      else if (e.key === "Enter" && hi >= 0) { e.preventDefault(); pick(sugFor, items[hi]); }
+    });
+    // Escape closes the list first and the menu only on a second press.
+    // The menu listens on document in the capture phase, so this listens on window.
+    const onEsc = (e) => {
+      if (!el.isConnected) { removeEventListener("keydown", onEsc, true); return; }
+      if (e.key === "Escape" && !sl.hidden) { e.preventDefault(); e.stopPropagation(); seq++; hideSug(); }
+    };
+    addEventListener("keydown", onEsc, true);
     if (focusLast) focusRule();
     el.addEventListener("input", (e) => {
       const t = e.target, i = t.dataset.i;
       if (i === undefined) return;
       const f = this.settings.filters[+i];
-      if (t.dataset.k === "val") { f.val = t.value; apply(); return; }
+      if (t.dataset.k === "val") { f.val = t.value; apply(); if (t.dataset.sug !== undefined) suggestSoon(t); return; }
       if (t.dataset.k === "col") {
         f.col = t.value;
         const ops = opsFor(kindOf(cols.find((c) => c.name === f.col)));

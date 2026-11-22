@@ -483,6 +483,30 @@ const tests = {
       if (S.view.rows.get(0)[1] !== "v7") throw new Error("shows " + S.view.rows.get(0)[1]);
     `);
   },
+
+  async "the filter menu suggests values for text fields"(sc) {
+    return run(`
+      await sql("CREATE TABLE ${sc}.places (id int PRIMARY KEY, loc text, n int); INSERT INTO ${sc}.places VALUES (1, 'Tallinn', 1), (2, 'Tartu', 2), (3, 'Tallinn', 3)");
+      await open_("${sc}", "places");
+      S.view.settings.filters = [{ col: "loc", op: "eq", val: "" }];
+      document.querySelector("[data-filter]").click();
+      await until(() => document.querySelector(".rules.pop"), "filter menu");
+      const input = document.querySelector(".rules input[data-k=val]");
+      input.focus();
+      // The headless page has no focus, so focus() fires no focusin.
+      input.dispatchEvent(new FocusEvent("focusin", { bubbles: true }));
+      const opts = () => document.querySelector(".rules .sug:not([hidden])") ? [...document.querySelectorAll(".rules .sug .mi")].map((o) => o.textContent).join() : "";
+      await until(() => opts() === "Tallinn,Tartu", "suggested values, got " + opts());
+      input.value = "tar";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      await until(() => opts() === "Tartu", "narrowed suggestions, got " + opts());
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }));
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+      if (input.value !== "Tartu" || S.view.settings.filters[0].val !== "Tartu") throw new Error("picked " + input.value);
+      if (!document.querySelector(".rules .sug[hidden]")) throw new Error("list still open after pick");
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    `);
+  },
 };
 
 // Run against a server started with -no-sql (E2E_SUITE=nosql).
