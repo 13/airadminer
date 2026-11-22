@@ -1,12 +1,12 @@
-# airadminer
+# <img src="docs/img/logo.svg" alt="" width="36" valign="middle"> airadminer
 
 A spreadsheet interface for PostgreSQL that ships as a single binary.
 
 Deploy it like Adminer: copy one file, run it, open the browser. Use it like Airtable: scroll through millions of rows, edit cells in place, and paste blocks straight from a spreadsheet.
 
-[![CI](https://github.com/13/airadminer/actions/workflows/ci.yml/badge.svg)](https://github.com/13/airadminer/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/13/airadminer)](https://github.com/13/airadminer/releases/latest)
-[![Container](https://img.shields.io/badge/ghcr.io-13%2Fairadminer-blue)](https://github.com/users/13/packages/container/package/airadminer)
+[![CI](https://github.com/13/airadminer/actions/workflows/ci.yml/badge.svg)](https://github.com/13/airadminer/actions/workflows/ci.yml) [![Release](https://img.shields.io/github/v/release/13/airadminer)](https://github.com/13/airadminer/releases/latest) [![Container](https://img.shields.io/badge/ghcr.io-13%2Fairadminer-blue)](https://github.com/users/13/packages/container/package/airadminer)
+
+![airadminer in dark mode, editing a cell in the shop.customers table](docs/img/screenshot.png)
 
 ## Highlights
 
