@@ -70,6 +70,7 @@ const helpers = `
     await until(() => S.view && S.view.meta && S.view.meta.name === name && S.view.rows.ready, "table " + name);
   };
   window.col = (n) => S.view.grid.cols.findIndex((c) => c.name === n);
+  window.closePop_ = () => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
   window.toggleSide = A.toggleSide; window.setDensity = A.setDensity; window.fitWidths = A.fitWidths;
   window.drawnWidth = (g) => g.rnw + g.ws.reduce((a, b) => a + b, 0);
   __AA_E2E.confirm = true;   // confirm every dialog
@@ -225,6 +226,151 @@ const tests = {
       await S.view.paste({ r0: 2, r1: 2, c0: c, c1: c }, pastedMatrix(lastCopy.text));
       const rows = await sql("SELECT id, t IS NULL, t FROM ${sc}.items WHERE id IN (3, 4) ORDER BY id");
       if (JSON.stringify(rows) !== JSON.stringify([["3", "t", null], ["4", "f", "x"]])) throw new Error(JSON.stringify(rows));
+    `);
+  },
+
+  async "local numbers, dates and times are read as Postgres reads them"() {
+    return run(`
+      const { inputReader, setInputFormat } = __AA_E2E.app;
+      const N = { name: "n", kind: "num", udt: "numeric" }, I = { name: "i", kind: "num", udt: "int4" };
+      const D = { name: "d", kind: "date", udt: "date" }, T = { name: "ts", kind: "datetime", udt: "timestamptz" };
+      const H = { name: "t", kind: "time", udt: "time" }, V = { name: "iv", kind: "time", udt: "interval" }, X = { name: "x", kind: "text", udt: "text" };
+      const read = (cols, columns) => { const r = inputReader(cols, columns); return { out: columns.map((vs, j) => vs.map(r.convs[j])), guesses: r.guesses.map((g) => g.v), problems: r.problems.length }; };
+      const eq = (got, want) => { if (JSON.stringify(got) !== JSON.stringify(want)) throw new Error(JSON.stringify(got) + " != " + JSON.stringify(want)); };
+      setInputFormat("date", "dmy"); setInputFormat("num", "comma");
+      try {
+        eq(read([N], [["123,47", "1.234,56", "1,234.56", "0,5", "-€ 1.234,56", "1 234,56", "1.234.567", "12.5", "(1.234,56)", "−5", "EUR 12,50", "12,50 CHF"]]).out,
+           [["123.47", "1234.56", "1234.56", "0.5", "-1234.56", "1234.56", "1234567", "12.5", "-1234.56", "-5", "12.50", "12.50"]]);
+        eq(read([N], [["1.2.3", "abc", "1e5", "12 %", "ABC123", ""]]).out, [["1.2.3", "abc", "1e5", "12 %", "ABC123", ""]]);
+        eq(read([I], [["1.234"]]).out, [["1234"]]);                                   // integers follow the same rules
+        eq(read([N], [["3 4", "12 5,5", "1'2", "(-5)", "- 5"]]).out, [["3 4", "12 5,5", "1'2", "(-5)", "-5"]]); // spaces only group thousands
+        eq(read([N], [["1 234 567,5", "1’234,5"]]).out, [["1234567.5", "1234.5"]]);
+        eq(read([N], [["1" + " ".repeat(100000) + "x"]]).problems, 0);                 // long values are left alone, quickly
+        eq(read([N], [["1,234"]]).out, [["1.234"]]);                                  // the setting decides
+        eq(read([N], [["1,234", "1,234.5"]]).out, [["1234", "1234.5"]]);              // the column decides
+        eq(read([N, N], [["1,234.56"], ["1,234"]]).out, [["1234.56"], ["1234"]]);     // the rest of the paste decides
+        eq(read([D], [["18/09/2026", "1/9/2026", "18.09.2026", "2026-09-18", "13/13/2026", "05/09/26", "05/09/99"]]).out,
+           [["2026-09-18", "2026-09-01", "2026-09-18", "2026-09-18", "13/13/2026", "2026-09-05", "1999-09-05"]]);
+        eq(read([D], [["01/02/2026", "02/25/2026"]]).out, [["2026-01-02", "2026-02-25"]]);
+        eq(read([D], [["26-09-18", "18-09-2026"]]).out, [["26-09-18", "2026-09-18"]]); // 26-09-18 is year first
+        eq(read([T], [["18.09.2026 14.30", "18.09.2026, 14.30.15+02"]]).out, [["2026-09-18 14:30", "2026-09-18 14:30:15+02"]]);
+        eq(read([H, V], [["14.30"], ["1.5"]]).out, [["14:30"], ["1.5"]]);            // an interval 1.5 is seconds
+        eq(read([X], [["123,47"]]).out, [["123,47"]]);
+        eq(read([D], [["13/01/2026", "01/13/2026", "01/02/2026"]]).problems, 1);     // mixed orders: refuse the ambiguous one
+        eq(read([N, D], [["1,234"], ["01/02/2026"]]).guesses, ["1,234"]);             // set explicitly: only numbers are confirmed
+        eq(read([D], [["18/09/45"]]).guesses, ["18/09/45"]);                          // the century is a guess
+        eq(inputReader([N], [["1.500"]], { typed: true }).guesses, []);              // typed in the chosen format
+        setInputFormat("date", "auto"); setInputFormat("num", "auto");
+        eq(read([N, D], [["1,234", "123,47"], ["01/02/2026", "18/09/2026"]]).guesses, []);
+        eq(read([N, D], [["1,234"], ["01/02/2026"]]).guesses, ["1,234", "01/02/2026"]);
+      } finally { setInputFormat("date", "auto"); setInputFormat("num", "auto"); }
+    `);
+  },
+
+  async "pasted and typed local numbers and dates are saved converted"(sc) {
+    return run(`
+      const { setInputFormat } = __AA_E2E.app;
+      await sql("CREATE TABLE ${sc}.items (id int PRIMARY KEY, price numeric(10,2), released date); INSERT INTO ${sc}.items VALUES (1, 0, NULL), (2, 0, NULL), (3, 0, NULL)");
+      await open_("${sc}", "items");
+      const p = col("price"), d = col("released");
+      const saved = async () => JSON.stringify((await sql("SELECT price::text, released::text FROM ${sc}.items ORDER BY id")));
+      await S.view.paste({ r0: 0, r1: 0, c0: p, c1: d }, [["123,47", "18/09/2026"], ["1.234,56", "1/9/2026"]]);
+      if (await saved() !== JSON.stringify([["123.47", "2026-09-18"], ["1234.56", "2026-09-01"], ["0.00", null]])) throw new Error("paste: " + await saved());
+      // a column that mixes date orders is not pasted at all
+      await S.view.paste({ r0: 0, r1: 0, c0: d, c1: d }, [["13/01/2026"], ["01/13/2026"], ["01/02/2026"]]);
+      await new Promise((r) => setTimeout(r, 200)); await S.view.writeChain;
+      if (await saved() !== JSON.stringify([["123.47", "2026-09-18"], ["1234.56", "2026-09-01"], ["0.00", null]])) throw new Error("mixed paste changed: " + await saved());
+      setInputFormat("date", "dmy"); setInputFormat("num", "comma");
+      try {
+        const g = S.view.grid;
+        g.select(2, p); g.startEdit("9,99"); g.commitEdit();
+        await until(async () => (await sql("SELECT price::text FROM ${sc}.items WHERE id = 3"))[0][0] === "9.99", "typed number saved");
+        await S.view.writeChain;
+        g.select(2, d); g.startEdit("05/09/2026"); g.commitEdit();
+        await until(async () => (await sql("SELECT released::text FROM ${sc}.items WHERE id = 3"))[0][0] === "2026-09-05", "typed date saved");
+        await S.view.writeChain;
+        S.view.expand(2);
+        await until(() => drawer && drawer.fields, "record form");
+        drawer.fields.find((f) => f.c.name === "price").val = "1.000,5";
+        drawer.fields.find((f) => f.c.name === "released").val = "06.09.2026";
+        await saveRecord();
+        const [[pr, rel]] = await sql("SELECT price::text, released::text FROM ${sc}.items WHERE id = 3");
+        if (pr !== "1000.50" || rel !== "2026-09-06") throw new Error("record form saved " + JSON.stringify([pr, rel]));
+        await closeDrawer(true);
+      } finally { setInputFormat("date", "auto"); setInputFormat("num", "auto"); }
+    `);
+  },
+
+  async "pastes name what they guessed and refuse mixed formats"(sc) {
+    return run(`
+      await sql("CREATE TABLE ${sc}.items (id int PRIMARY KEY, price numeric(10,3), released date); INSERT INTO ${sc}.items VALUES (1, 0, NULL), (2, 0, NULL), (3, 0, NULL)");
+      await open_("${sc}", "items");
+      __AA_E2E.dialogs = [];
+      await S.view.paste({ r0: 0, r1: 0, c0: col("price"), c1: col("released") }, [["1,234", "01/02/2026"]]);
+      const body = __AA_E2E.dialogs.map((d) => d.body).join(" ");
+      if (!body.includes("“1,234” as") || !body.includes("“01/02/2026” as") || !body.includes(navigator.language)) throw new Error("dialog: " + body);
+      document.querySelectorAll(".toast").forEach((t) => t.remove());
+      await S.view.paste({ r0: 0, r1: 0, c0: col("released"), c1: col("released") }, [["13/01/2026"], ["01/13/2026"], ["01/02/2026"]]);
+      const err = document.querySelector(".toast.err")?.textContent || "";
+      if (!err.includes("Cannot tell how to read “01/02/2026” in released")) throw new Error("toast: " + err);
+      document.querySelectorAll(".toast").forEach((t) => t.remove());
+    `);
+  },
+
+  async "a stored number is edited in the chosen format without changing it"(sc) {
+    return run(`
+      const { setInputFormat } = __AA_E2E.app;
+      await sql("CREATE TABLE ${sc}.items (id int PRIMARY KEY, price numeric(10,3)); INSERT INTO ${sc}.items VALUES (1, 123.456), (2, 1.5)");
+      await open_("${sc}", "items");
+      setInputFormat("num", "comma");
+      try {
+        const g = S.view.grid, p = col("price");
+        g.select(0, p); g.startEdit();
+        if (g.editor.input.value !== "123,456") throw new Error("editor shows " + g.editor.input.value);
+        g.commitEdit();                                                     // untouched: no write
+        await new Promise((r) => setTimeout(r, 200)); await S.view.writeChain;
+        g.select(0, p); g.startEdit(); g.editor.input.value = "123,457"; g.commitEdit();
+        await until(async () => (await sql("SELECT price::text FROM ${sc}.items WHERE id = 1"))[0][0] === "123.457", "edited number saved");
+        await S.view.writeChain;
+        S.view.expand(1);
+        await until(() => drawer && drawer.fields, "record form");
+        const f = drawer.fields.find((x) => x.c.name === "price");
+        if (f.val !== "1,500" || f.changed()) throw new Error("form shows " + f.val);
+        f.val = "2,25";
+        await saveRecord();
+        const [[v]] = await sql("SELECT price::text FROM ${sc}.items WHERE id = 2");
+        if (v !== "2.250") throw new Error("record form saved " + v);
+        await closeDrawer(true);
+      } finally { setInputFormat("num", "auto"); }
+    `);
+  },
+
+  async "filters and foreign keys read local formats; the View menu fits the window"(sc) {
+    return run(`
+      const { setInputFormat } = __AA_E2E.app;
+      await sql("CREATE TABLE ${sc}.p (id numeric PRIMARY KEY); INSERT INTO ${sc}.p VALUES (1.5); CREATE TABLE ${sc}.items (id int PRIMARY KEY, price numeric(10,2), p numeric REFERENCES ${sc}.p); INSERT INTO ${sc}.items VALUES (1, 5, NULL), (2, 50, NULL)");
+      await open_("${sc}", "items");
+      setInputFormat("num", "comma");
+      try {
+        S.view.paste({ r0: 0, r1: 0, c0: col("p"), c1: col("p") }, [["1,5"]]);
+        await until(async () => (await sql("SELECT p::text FROM ${sc}.items WHERE id = 1"))[0][0] === "1.5", "foreign key pasted");
+        await S.view.writeChain;
+        S.view.settings.filters = [{ col: "price", op: "gt", val: "" }];
+        document.querySelector("[data-filter]").click();
+        await until(() => document.querySelector('.pop [data-k="val"]'), "filter value box");
+        const box = document.querySelector('.pop [data-k="val"]');
+        box.value = "10,5"; box.dispatchEvent(new Event("input", { bubbles: true }));
+        if (S.view.settings.filters[0].val !== "10.5") throw new Error("filter value " + S.view.settings.filters[0].val);
+        closePop_();
+        await new Promise((r) => setTimeout(r, 400));                       // the filter's debounced reload
+        S.view.settings.filters = []; S.view.refresh(true);
+        await until(() => S.view.rows.ready, "rows without the filter");
+      } finally { setInputFormat("num", "auto"); }
+      document.querySelector("[data-view]").click();
+      await until(() => document.querySelector(".pop [data-fmt-num]"), "View menu");
+      const pop = document.querySelector(".pop [data-fmt-num]").closest(".pop");
+      if (pop.getBoundingClientRect().bottom > innerHeight) throw new Error("View menu runs past the window: " + pop.getBoundingClientRect().bottom + " > " + innerHeight);
+      closePop_();
     `);
   },
 

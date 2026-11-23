@@ -152,6 +152,8 @@ function openPop(anchor, el, { align = "left", onClose, cls = "" } = {}) {
     if (top + h > innerHeight - 8 && r.top - h - 6 > 8) top = r.top - h - 6;
     el.style.left = left + "px";
     el.style.top = Math.max(8, top) + "px";
+    const room = innerHeight - 8 - Math.max(8, top);
+    if (h > room) { el.style.maxHeight = room + "px"; el.style.overflowY = "auto"; }
   };
   place();
   const p = {
@@ -181,7 +183,7 @@ function menuKeys(root, input) {
 }
 
 function dialog({ title, body, ok = "Delete", cancel = "Cancel", danger = true }) {
-  if (E2E && E2E.confirm) return Promise.resolve(true);
+  if (E2E && E2E.confirm) { (E2E.dialogs ||= []).push({ title, body }); return Promise.resolve(true); }
   return new Promise((resolve) => {
     const scrim = html(`<div class="scrim" style="z-index:60"></div>`);
     const d = html(`<div class="pop dialog" role="alertdialog" aria-modal="true">
@@ -440,6 +442,195 @@ function parseTSV(text) {
   row.push(cur); rows.push(row);
   return rows;
 }
+
+// ---------- numbers and dates in local formats
+// Numbers, dates and times pasted or typed in local formats (123,47;
+// 18/09/2026; 14.30) become the forms Postgres reads (123.47; 2026-09-18;
+// 14:30). A value that settles the format on its own (1.234,56; 25/02/2026)
+// decides the ambiguous ones (1,234; 01/02/2026) in its column, else in the
+// rest of the paste; failing that, the format set in the View menu or the
+// browser's language does. Anything else is passed through for Postgres.
+const BROWSER_FMT = (() => {
+  try {
+    const dec = new Intl.NumberFormat().formatToParts(1.5).find((p) => p.type === "decimal")?.value;
+    const parts = new Intl.DateTimeFormat(undefined, { year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date(2026, 8, 18));
+    const first = parts.find((p) => p.type === "day" || p.type === "month")?.type;
+    return { dec: dec === "," ? "," : ".", dayFirst: first !== "month" };
+  } catch { return { dec: ".", dayFirst: true }; }
+})();
+function inputFormat() {
+  const f = S.fmt;
+  return {
+    dec: f.num === "comma" ? "," : f.num === "point" ? "." : BROWSER_FMT.dec, numAuto: f.num !== "comma" && f.num !== "point",
+    dayFirst: f.date === "dmy" ? true : f.date === "mdy" ? false : BROWSER_FMT.dayFirst, dateAuto: f.date !== "dmy" && f.date !== "mdy",
+  };
+}
+// No number or date is longer; longer values are left alone, which also
+// keeps the patterns below cheap.
+const MAX_LOCAL = 64;
+const CUR = "(?:[€$£¥₹]|EUR|USD|GBP|CHF|JPY|CAD|AUD|NZD|SEK|NOK|DKK|PLN|CZK|HUF|CNY|INR|BRL|ZAR)";
+const RE_CUR_START = new RegExp(`^${CUR}\\s*`), RE_CUR_END = new RegExp(`\\s*${CUR}$`);
+// spaces and apostrophes that group thousands
+const RE_GROUP = /[\s\u00a0\u202f'\u2019]/, RE_GROUPS = new RegExp(RE_GROUP.source, "g");
+// A number's sign and digits with separators, without currency, accounting
+// parentheses or thousands spaces; null if it is not one.
+function readNumber(v) {
+  if (v.length > MAX_LOCAL) return null;
+  let s = v.trim().replace(/\u2212/g, "-"), neg = false;
+  const p = /^\((.*)\)$/.exec(s);
+  if (p) { neg = true; s = p[1].trim(); }
+  s = s.replace(RE_CUR_START, "");
+  if (/^[-+]/.test(s)) {
+    if (p) return null; // (-5)
+    neg = s[0] === "-";
+    s = s.slice(1).trimStart().replace(RE_CUR_START, "");
+  }
+  s = s.replace(RE_CUR_END, "");
+  if (RE_GROUP.test(s)) {
+    s = s.replace(RE_GROUPS, " ");
+    if (!/^\d{1,3}(?: \d{3})+(?:[.,]\d+)?$/.test(s)) return null; // 1 234 567, not 3 4
+    s = s.replace(/ /g, "");
+  }
+  return /^(?:\d|[.,]\d)[\d.,]*$/.test(s) && /\d$/.test(s) ? { neg, s } : null;
+}
+// The decimal separator a number shows on its own: ".", ",", "" for none,
+// or null when it could be either (1,234).
+function decimalOf(s) {
+  const dots = s.split(".").length - 1, commas = s.split(",").length - 1;
+  if (dots && commas) return s.lastIndexOf(".") > s.lastIndexOf(",") ? "." : ",";
+  if (!dots && !commas) return "";
+  const c = dots ? "." : ",", other = dots ? "," : ".";
+  if (dots + commas > 1) return other; // 1.234.567: thousands
+  return /^[1-9]\d{0,2}[.,]\d{3}$/.test(s) ? null : c;
+}
+const RE_THOUSANDS = { ".": /^\d{1,3}(\.\d{3})+$/, ",": /^\d{1,3}(,\d{3})+$/ };
+function numberText(n, d) {
+  const t = d === "." ? "," : ".", at = d ? n.s.indexOf(d) : -1;
+  // one decimal separator at most, no thousands separator after it, and
+  // thousands separators only between groups of three digits
+  if (at >= 0 && (n.s.indexOf(d, at + 1) >= 0 || n.s.indexOf(t, at) >= 0)) return null;
+  const int = at >= 0 ? n.s.slice(0, at) : n.s;
+  if (int.includes(t) && !RE_THOUSANDS[t].test(int)) return null;
+  const out = n.s.split(t).join("").replace(d || "\0", ".");
+  return (n.neg && /[1-9]/.test(out) ? "-" : "") + out;
+}
+const DATE_RE = /^(\d{1,2})([/.-])(\d{1,2})\2(\d{4}|\d{2})(?:(?:,?\s+|T)(\S.*))?$/;
+// D/M/Y or M/D/Y; with dashes only a four-digit year, as 26-09-18 is year first.
+function matchDate(v) {
+  if (v.length > MAX_LOCAL) return null;
+  const m = DATE_RE.exec(v.trim());
+  return m && !(m[2] === "-" && m[4].length === 2) ? m : null;
+}
+// 14.30 and 14.30.15 as 14:30 and 14:30:15.
+const dotTime = (t) => t.length > MAX_LOCAL ? t : t.replace(/^(\d{1,2})\.(\d{2})(?:\.(\d{2}))?(?=$|[\s.,+-]|[A-Za-z])/, (all, h, m, sec) =>
+  +h > 24 || +m > 59 || (sec && +sec > 60) ? all : `${h}:${m}` + (sec ? ":" + sec : ""));
+const fmtGroup = (c) => (c.kind === "num" ? "num" : c.kind === "date" || c.kind === "datetime" ? "date" : null);
+// What one value tells about its format: "." or "," for numbers, true
+// (day first) or false for dates, null when it is ambiguous, undefined when
+// it tells nothing.
+function evidence(col, v) {
+  if (col.kind === "num") { const n = readNumber(v); const d = n ? decimalOf(n.s) : undefined; return d === "" ? undefined : d; }
+  if (fmtGroup(col) === "date") { const m = matchDate(v); return !m ? undefined : +m[1] > 12 ? true : +m[3] > 12 ? false : null; }
+}
+// `pick` is the reading for an ambiguous value: a decimal separator or day-first.
+function convertValue(col, v, pick) {
+  if (col.kind === "num") {
+    const n = readNumber(v);
+    if (!n) return v;
+    let d = decimalOf(n.s);
+    if (d === null) d = pick;
+    return (d != null && numberText(n, d)) || v;
+  }
+  if (fmtGroup(col) === "date") {
+    const m = matchDate(v);
+    if (!m) return v;
+    const a = +m[1], b = +m[3];
+    const df = a > 12 ? true : b > 12 ? false : pick;
+    if (df == null) return v;
+    const [day, month] = df ? [a, b] : [b, a];
+    if (month < 1 || month > 12 || day < 1 || day > 31) return v;
+    // two-digit years as spreadsheets read them: 00-29 is 20xx
+    const year = m[4].length === 4 ? m[4] : (+m[4] < 30 ? "20" : "19") + m[4];
+    const pad = (x) => String(x).padStart(2, "0");
+    return `${year}-${pad(month)}-${pad(day)}` + (m[5] ? " " + dotTime(m[5]) : "");
+  }
+  if (col.kind === "time" && /^time/.test(col.udt || "")) return dotTime(v.trim());
+  return v;
+}
+// Readers for the pasted columns. `cols` are {name, kind, udt}, `columns`
+// their raw values. convs[j](v) reads one value of column j; `guesses` then
+// holds the readings worth a look before saving, and `problems` the values
+// no reading fits because their column mixes formats. A typed value is
+// written in the format the user chose, so that format is no guess there.
+function inputReader(cols, columns, { typed = false } = {}) {
+  const fmt = inputFormat();
+  const seen = columns.map((vals, j) => {
+    const s = new Set();
+    for (const v of vals) if (typeof v === "string" && v) { const e = evidence(cols[j], v); if (e != null) s.add(e); }
+    return s;
+  });
+  const all = { num: new Set(), date: new Set() };
+  seen.forEach((s, j) => { const g = fmtGroup(cols[j]); if (g) for (const e of s) all[g].add(e); });
+  const guesses = new Map(), problems = new Set();
+  const convs = cols.map((col, j) => {
+    const g = fmtGroup(col);
+    if (!g) return (v) => convertValue(col, v);
+    const own = seen[j], paste = all[g];
+    const fallback = !own.size && paste.size !== 1;
+    const pick = own.size === 1 ? [...own][0] : own.size > 1 ? undefined : paste.size === 1 ? [...paste][0] : g === "num" ? fmt.dec : fmt.dayFirst;
+    return (v) => {
+      const why = [];
+      let out;
+      if (evidence(col, v) !== null) out = convertValue(col, v);
+      else if (pick === undefined) {
+        problems.add(`Cannot tell how to read “${v}” in ${col.name}: the pasted values use both ${g === "num" ? "decimal commas and decimal points" : "day-first and month-first dates"}. Nothing was changed.`);
+        return v;
+      } else {
+        out = convertValue(col, v, pick);
+        // 1.234 from psql or a CSV export is a decimal point whatever the setting
+        if (fallback && fmt[g + "Auto"]) why.push("browser");
+        else if (fallback && g === "num" && !typed) why.push("setting");
+      }
+      if (g === "date" && out !== v && matchDate(v)[4].length === 2) why.push("century");
+      if (why.length) guesses.set(v, { out, g, why });
+      return out;
+    };
+  });
+  return { convs, get guesses() { return [...guesses].map(([v, x]) => ({ v, ...x })); }, get problems() { return [...problems]; } };
+}
+function guessText(guesses) {
+  const why = { browser: `your browser's language, ${navigator.language}`, setting: "the number format in the View menu", century: "a two-digit year" };
+  const show = (x) => {
+    let as = x.out;
+    if (x.g === "date") {
+      const [y, m, d] = x.out.slice(0, 10).split("-").map(Number);
+      as = new Date(y, m - 1, d).toLocaleDateString(undefined, { day: "numeric", month: "long", year: "numeric" });
+    }
+    return `“${x.v}” as ${as} (${x.why.map((w) => why[w]).join(", ")})`;
+  };
+  const list = guesses.slice(0, 3).map(show).join("; ") + (guesses.length > 3 ? `; and ${plural(guesses.length - 3, "more value")}` : "");
+  return `Check how these were read: ${list}. The View menu sets the date and number format.`;
+}
+// A grid column, record form field or table column as the reader needs it.
+// Foreign keys are read as the type they hold.
+const colType = (c) => {
+  const m = c.meta || c;
+  return { name: c.name, kind: c.kind && c.kind !== "link" ? c.kind : kindOf({ ...m, fk: null }), udt: m.udt };
+};
+// A value typed into a cell, the record form or a filter, read like a pasted one.
+function readTyped(col, v, { quiet = false } = {}) {
+  const r = inputReader([col], [[v]], { typed: true });
+  const out = r.convs[0](v);
+  if (!quiet && r.guesses.length) toast(guessText(r.guesses));
+  return out;
+}
+// A stored number shown for editing in the chosen format, so the edit is
+// read back the same way: 123.456 as 123,456 with decimal commas.
+function editText(col, v) {
+  if (typeof v !== "string" || colType(col).kind !== "num" || inputFormat().dec !== ",") return v;
+  return /^-?\d+\.\d+$/.test(v) ? v.replace(".", ",") : v;
+}
+
 // With -csv-escape-formulas, a cell a spreadsheet would run as a formula
 // gets a leading apostrophe, as server exports do.
 const escapeFormula = (v) => v && /^[=+\-@\t\r]/.test(v) && !/^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$/.test(v) ? "'" + v : v;
@@ -977,7 +1168,7 @@ class Grid {
 
   openEditor(r, c, col, row, initial, readonly) {
     const v = row[col.idx];
-    let text = v ?? "";
+    let text = v == null ? "" : readonly ? v : editText(col, v);
     if (readonly && col.kind === "json" && v) text = prettyJSON(v) ?? v;
     const multi = col.kind === "json" || (col.kind === "text" && (/\n/.test(text) || text.length > 40)) || (readonly && text.length > 40);
     const ed = html(`<div class="g-editor ${["json", "uuid", "num", "array", "range", "other", "net"].includes(col.kind) ? "mono" : ""}"></div>`);
@@ -992,7 +1183,7 @@ class Grid {
       ed.appendChild(html(`<div class="hint">${readonly ? "<span>Read-only</span><span>Esc closes</span>" : `<span>Enter saves</span>${multi ? "<span>Shift+Enter adds a line</span>" : ""}<span>Esc cancels</span>`}</div>`));
     }
     this.sc.appendChild(ed);
-    this.editor = { r, c, col, row, el: ed, input, orig: v, multi, readonly, initial };
+    this.editor = { r, c, col, row, el: ed, input, orig: v, shown: text, multi, readonly, initial };
     this.placeEditor();
     input.focus();
     if (initial == null) input.select(); else input.setSelectionRange(input.value.length, input.value.length);
@@ -1092,6 +1283,7 @@ class Grid {
       let val = ed.input.value;
       const blankIsNull = !["text"].includes(ed.col.kind);
       if (val === "" && (ed.orig === null || blankIsNull)) val = ed.col.nullable === false && !blankIsNull ? "" : null;
+      if (val != null && val !== ed.orig) val = ed.initial == null && val === ed.shown ? ed.orig : readTyped(colType(ed.col), val);
       if (val !== ed.orig) this.o.onEdit(ed.r, ed.col, val, ed.row);
     }
     if (dr || dc) this.select(ed.r + dr, ed.c + dc);
@@ -1114,6 +1306,8 @@ const S = {
   collapsed: new Set(store.get("aa.collapsed", [])),
   side: store.get("aa.side", true) !== false,
   density: store.get("aa.density", "comfortable") === "compact" ? "compact" : "comfortable",
+  // How typed and pasted dates and numbers are read: "auto" follows the browser.
+  fmt: { date: store.get("aa.fmt.date", "auto"), num: store.get("aa.fmt.num", "auto") },
   view: null,
   filterText: "",
   pendingFilter: null,
@@ -1168,6 +1362,11 @@ function setDensity(d) {
   if (g) g.refresh();
 }
 
+function setInputFormat(group, v) {
+  S.fmt[group] = v;
+  store.set("aa.fmt." + group, v);
+}
+
 function toggleFit() {
   if (S.view && S.view.toggleFit) S.view.toggleFit();
 }
@@ -1183,6 +1382,10 @@ function viewMenu(anchor, view) {
     ${["Short", "Medium", "Tall"].map((n, i) => `<button class="mi ${view.rowHeight === i ? "on" : ""}" data-rh="${i}" role="menuitemradio" aria-checked="${view.rowHeight === i}">${icon("i-rows")}${n}${chk(view.rowHeight === i)}</button>`).join("")}
     <hr><h4>Density</h4>
     ${[["comfortable", "Comfortable"], ["compact", "Compact"]].map(([d, n]) => `<button class="mi ${S.density === d ? "on" : ""}" data-density="${d}" role="menuitemradio" aria-checked="${S.density === d}">${icon("i-grid")}${n}${chk(S.density === d)}</button>`).join("")}
+    <hr><h4>Typed and pasted dates</h4>
+    ${[["auto", `Browser default (${BROWSER_FMT.dayFirst ? "31/12/2026" : "12/31/2026"})`], ["dmy", "Day first: 31/12/2026"], ["mdy", "Month first: 12/31/2026"]].map(([d, n]) => `<button class="mi ${S.fmt.date === d ? "on" : ""}" data-fmt-date="${d}" role="menuitemradio" aria-checked="${S.fmt.date === d}">${icon("t-date")}${n}${chk(S.fmt.date === d)}</button>`).join("")}
+    <h4>Typed and pasted numbers</h4>
+    ${[["auto", `Browser default (${BROWSER_FMT.dec === "," ? "1.234,56" : "1,234.56"})`], ["comma", "Decimal comma: 1.234,56"], ["point", "Decimal point: 1,234.56"]].map(([d, n]) => `<button class="mi ${S.fmt.num === d ? "on" : ""}" data-fmt-num="${d}" role="menuitemradio" aria-checked="${S.fmt.num === d}">${icon("t-num")}${n}${chk(S.fmt.num === d)}</button>`).join("")}
     <hr>
     <button class="mi ${view.fit ? "on" : ""}" data-fit role="menuitemcheckbox" aria-checked="${view.fit}">${icon("i-expand")}Fit columns to screen<span class="r">${view.fit ? icon("i-check", "sm") : `<span class="kbd">${FIT_KEY}</span>`}</span></button>
   </div>`);
@@ -1195,6 +1398,8 @@ function viewMenu(anchor, view) {
     closePop();
     if (b.dataset.rh != null) view.setRowHeight(+b.dataset.rh);
     else if (b.dataset.density) setDensity(b.dataset.density);
+    else if (b.dataset.fmtDate) setInputFormat("date", b.dataset.fmtDate);
+    else if (b.dataset.fmtNum) setInputFormat("num", b.dataset.fmtNum);
     else if (b.hasAttribute("data-fit")) view.toggleFit();
   });
 }
@@ -1936,7 +2141,7 @@ class TableView {
       <button class="btn" data-fields>${icon("i-eyeoff")}<span class="lbl-txt" data-l>Hide fields</span></button>
       <button class="btn" data-filter>${icon("i-filter")}<span class="lbl-txt" data-l>Filter</span></button>
       <button class="btn" data-sort>${icon("i-sort")}<span class="lbl-txt" data-l>Sort</span></button>
-      <button class="btn" data-view title="Row height, density and fit to screen">${icon("i-columns")}<span class="lbl-txt" data-l>View</span></button>
+      <button class="btn" data-view title="Row height, density, input formats and fit to screen">${icon("i-columns")}<span class="lbl-txt" data-l>View</span></button>
       <span class="sep"></span>
       <div class="tsearch">${icon("i-search", "sm")}<input class="input" data-search placeholder="Search all fields" spellcheck="false" aria-label="Search all fields"></div>
       <span class="spacer"></span>
@@ -2097,7 +2302,10 @@ class TableView {
       const t = e.target, i = t.dataset.i;
       if (i === undefined) return;
       const f = this.settings.filters[+i];
-      if (t.dataset.k === "val") { f.val = t.value; apply(); if (t.dataset.sug !== undefined) suggestSoon(t); return; }
+      if (t.dataset.k === "val") {
+        const c = f.op !== "sql" && this.meta.columns.find((x) => x.name === f.col);
+        f.val = c ? readTyped(colType(c), t.value, { quiet: true }) : t.value;
+        apply(); if (t.dataset.sug !== undefined) suggestSoon(t); return; }
       if (t.dataset.k === "col") {
         f.col = t.value;
         const ops = opsFor(kindOf(cols.find((c) => c.name === f.col)));
@@ -2456,10 +2664,15 @@ class TableView {
     // Rows that fall past the last record become new records, but only when
     // the end of the table is known, i.e. the count is exact.
     const canAdd = this.editable && this.rows.exact && !single;
-    const value = (col, raw) => {
+    // Values copied from a grid are already in Postgres's format.
+    const fromGrid = lastCopy && matrix === lastCopy.matrix;
+    const target = cols.slice(s.c0, s.c0 + width);
+    const reader = fromGrid ? null : inputReader(target.map(colType), target.map((_, j) => (single ? [matrix[0][0]] : matrix.map((r) => r[j]))));
+    const value = (col, raw, j) => {
       let v = raw;
       if (v === null) return col.nullable === false && col.kind === "text" ? "" : null; // a NULL copied from a grid
       if (v === "" && col.kind !== "text") v = null;
+      if (v != null && reader) v = reader.convs[j](v);
       if (col.kind === "bool" && v != null) v = /^(t|true|yes|y|1|on|x|✓|checked)$/i.test(v.trim()) ? "true" : "false";
       return v;
     };
@@ -2474,7 +2687,7 @@ class TableView {
           const raw = (matrix[i][j] === undefined ? "" : matrix[i][j]);
           // Empty cells are left out so the column default applies.
           if (col.readonly || raw === "") continue;
-          values[col.name] = value(col, raw);
+          values[col.name] = value(col, raw, j);
         }
         inserts.push(values);
         continue;
@@ -2483,16 +2696,19 @@ class TableView {
       for (let j = 0; j < width && s.c0 + j < cols.length; j++) {
         const col = cols[s.c0 + j];
         if (col.readonly) continue;
-        jobs.push([r, col.name, value(col, single ? matrix[0][0] : ((matrix[i][j] === undefined ? "" : matrix[i][j])))]);
+        jobs.push([r, col.name, value(col, single ? matrix[0][0] : ((matrix[i][j] === undefined ? "" : matrix[i][j])), j)]);
       }
     }
+    if (reader && reader.problems.length) { toast(reader.problems[0], { err: true }); return; }
     if (!jobs.length && !inserts.length) { toast(dropped ? "Nothing to paste: the rows are past the end of the table" : "Nothing to paste into: the selected fields are read-only"); return; }
     if (jobs.length > 2000 || inserts.length > 2000) { toast("Paste up to 2,000 cells at a time"); return; }
     const changes = this.byRow(jobs);
-    if (inserts.length || jobs.length > 20 || dropped) {
+    const guesses = reader ? reader.guesses : [];
+    if (inserts.length || jobs.length > 20 || dropped || guesses.length) {
       const parts = [jobs.length && `updates ${plural(jobs.length, "cell")}`, inserts.length && `adds ${plural(inserts.length, "new record")}`].filter(Boolean).join(" and ");
       const skip = dropped ? ` ${plural(dropped, "pasted row")} past the end of the table will be left out, because new records cannot be added here.` : "";
-      const ok = await dialog({ title: inserts.length ? `Add ${plural(inserts.length, "record")}?` : `Paste into ${plural(jobs.length, "cell")}?`, body: `This paste ${parts}, in one transaction.${skip} Ctrl/⌘+Z undoes it.`, ok: "Paste", danger: false });
+      const read = guesses.length ? ` ${guessText(guesses)}` : "";
+      const ok = await dialog({ title: inserts.length ? `Add ${plural(inserts.length, "record")}?` : `Paste into ${plural(jobs.length, "cell")}?`, body: `This paste ${parts}, in one transaction.${skip}${read} Ctrl/⌘+Z undoes it.`, ok: "Paste", danger: false });
       if (!ok) return;
     }
     if (await this.applyChanges(changes, inserts, { label: "paste" }) && jobs.length + inserts.length > 1) {
@@ -2826,6 +3042,7 @@ function renderRecord() {
     const ro = !editable || c.generated === "s" || (c.identity === "a") || kind === "blob" || (blank && (c.identity || c.generated)) || selfFill || isCut(row, i + off);
     const f = { c, kind, orig, val: orig === undefined ? null : orig, touched: false, ro, selfFill, copied: !!copy };
     if (kind === "json" && orig != null) { const p = prettyJSON(orig); if (p != null) { f.pretty = p; f.val = p; } }
+    else if (!ro && orig != null && editText(c, orig) !== orig) { f.pretty = editText(c, orig); f.val = f.pretty; }
     f.changed = () => blank ? f.touched : f.val !== (f.pretty ?? f.orig);
     return f;
   });
@@ -3003,6 +3220,7 @@ async function saveRecord() {
     if (!f.changed()) continue;
     let v = f.val;
     if (v === "" && !["text", "json"].includes(f.kind) && f.c.nullable) v = null;
+    if (typeof v === "string" && v !== "") v = readTyped(colType(f.c), v);
     values[f.c.name] = v;
     if (!isNew) expect[f.c.name] = f.orig;
   }
@@ -3095,7 +3313,7 @@ class SqlView {
           <div class="rtabs tabs" data-rtabs hidden></div>
           <span class="stat" data-stat>Runs the selection, or everything when nothing is selected.</span>
           <span class="spacer"></span>
-          <button class="btn" data-view hidden title="Row height, density and fit to screen">${icon("i-columns")}<span class="lbl-txt">View</span></button>
+          <button class="btn" data-view hidden title="Row height, density, input formats and fit to screen">${icon("i-columns")}<span class="lbl-txt">View</span></button>
           <button class="btn" data-csv hidden>${icon("i-download")}<span class="lbl-txt">CSV</span></button>
         </div>
         <div class="sql-out" data-out></div>
@@ -3360,7 +3578,7 @@ addEventListener("keydown", (e) => {
 
 // Browser tests (e2e/grid.mjs) set window.__AA_E2E before this script runs
 // to reach internals; a normal page never has it.
-if (E2E) E2E.app = { S, api, prettyJSON, pastedMatrix, saveRecord, closeDrawer, switchDB, toggleSide, setDensity, fitWidths, get drawer() { return drawer; }, get lastCopy() { return lastCopy; } };
+if (E2E) E2E.app = { S, api, prettyJSON, pastedMatrix, inputReader, setInputFormat, saveRecord, closeDrawer, switchDB, toggleSide, setDensity, fitWidths, get drawer() { return drawer; }, get lastCopy() { return lastCopy; } };
 
 boot();
 })();
