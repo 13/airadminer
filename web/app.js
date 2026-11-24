@@ -1426,7 +1426,9 @@ async function signOut() {
   signedOut();
 }
 
-async function boot() {
+// After signing in, the URL may still name a table of the previous
+// connection; when the new database has no such table, start empty.
+async function boot(signedIn = false) {
   try {
     S.meta = await api("meta");
   } catch (e) {
@@ -1434,7 +1436,7 @@ async function boot() {
     renderLogin();
     return;
   }
-  await renderShell();
+  await renderShell(signedIn);
 }
 
 // ============================================================ login
@@ -1488,7 +1490,7 @@ function renderLogin(err) {
     try {
       await api("login", data);
       if (!useURL) store.set("aa.login", { host: data.host, port: data.port, user: data.user, database: data.database, sslmode: data.sslmode });
-      await boot();
+      await boot(true);
     } catch (er) {
       showErr(er);
       btn.disabled = false; btn.textContent = "Connect";
@@ -1504,8 +1506,14 @@ async function loadTables() {
   S.schemas = r.schemas;
 }
 
-async function renderShell() {
+async function renderShell(dropMissing = false) {
   try { await loadTables(); } catch (e) { toastErr(e); }
+  if (dropMissing && S.tables) {
+    const m = location.hash.match(/^#\/?t\/([^/?]+)\/([^/?]+)/);
+    let sch, nm;
+    try { [sch, nm] = m ? [decodeURIComponent(m[1]), decodeURIComponent(m[2])] : []; } catch {}
+    if (m && !S.tables.some((t) => t.schema === sch && t.name === nm)) history.replaceState(history.state, "", location.pathname + location.search);
+  }
   app.innerHTML = `
   <div class="shell${S.side ? "" : " side-collapsed"}">
     <aside class="side" id="side" aria-label="Tables">
